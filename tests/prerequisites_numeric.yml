@@ -29,6 +29,35 @@
           - (test_data_disk | int) >= ((test_requirements.data_disk_gb | int) * 1000000000)
           - (test_rc | int) == 0
 
+    - name: Model independent production and lab requirement profiles
+      ansible.builtin.set_fact:
+        production_requirements:
+          control_plane: { vcpu: 4, memory_gib: 8, os_disk_gb: 100, data_disk_gb: 0 }
+          worker: { vcpu: 8, memory_gib: 32, os_disk_gb: 100, data_disk_gb: 500 }
+          backup: { vcpu: 4, memory_gib: 8, os_disk_gb: 100, data_disk_gb: 2000 }
+        lab_overrides:
+          control_plane: { vcpu: 4, memory_gib: 8, os_disk_gb: 50, data_disk_gb: 0 }
+          worker: { vcpu: 4, memory_gib: 8, os_disk_gb: 32, data_disk_gb: 20 }
+
+    - name: Merge lab overrides over production requirements
+      ansible.builtin.set_fact:
+        lab_requirements: "{{ production_requirements | combine(lab_overrides, recursive=True) }}"
+
+    - name: Assert lab overrides do not mutate production thresholds
+      ansible.builtin.assert:
+        that:
+          - production_requirements.control_plane.os_disk_gb == 100
+          - production_requirements.worker.vcpu == 8
+          - production_requirements.worker.memory_gib == 32
+          - production_requirements.worker.os_disk_gb == 100
+          - production_requirements.worker.data_disk_gb == 500
+          - lab_requirements.control_plane.os_disk_gb == 50
+          - lab_requirements.worker.vcpu == 4
+          - lab_requirements.worker.memory_gib == 8
+          - lab_requirements.worker.os_disk_gb == 32
+          - lab_requirements.worker.data_disk_gb == 20
+          - lab_requirements.backup.data_disk_gb == 2000
+
     - name: Model unavailable and malformed diagnostics
       ansible.builtin.set_fact:
         missing_raw: ""
@@ -154,6 +183,26 @@
           - "'OVERALL RESULT: NOT READY' in summary_fixture"
           - "'Infrastructure: resolve before installation' in summary_fixture"
           - "'Carekube: resolve during installation' in summary_fixture"
+
+    - name: Render deduplicated infrastructure blocker summary fixture
+      ansible.builtin.set_fact:
+        duplicate_blocker_results:
+          - { section: STORAGE, status: FAIL, name: Dedicated role data disk, action_key: dedicated-role-data-disk, owner: Infrastructure, actual: "/dev/sdb 21.47 GB" }
+          - { section: LONGHORN, status: FAIL, name: Data path, action_key: dedicated-role-data-disk, owner: Infrastructure, actual: "/dev/sdb 21.47 GB" }
+
+    - name: Render deduplicated blocker entries
+      ansible.builtin.set_fact:
+        deduplicated_blocker_fixture: |
+          {% set emitted = namespace(keys=[]) %}
+          {% for result in duplicate_blocker_results if result.status == 'FAIL' %}{% set action_key = result.action_key | default(result.section ~ ':' ~ result.name) %}{% if action_key not in emitted.keys %}{% set _ = emitted.keys.append(action_key) %}- {{ result.status }} — {{ result.owner }} — {{ result.name }}
+          {% endif %}{% endfor %}
+
+    - name: Assert duplicate infrastructure blockers are listed once
+      ansible.builtin.assert:
+        that:
+          - deduplicated_blocker_fixture.splitlines() | select('search', 'Dedicated role data disk') | list | length == 1
+          - duplicate_blocker_results | selectattr('section', 'equalto', 'STORAGE') | list | length == 1
+          - duplicate_blocker_results | selectattr('section', 'equalto', 'LONGHORN') | list | length == 1
 
     - name: Render clean summary fixture
       ansible.builtin.set_fact:
@@ -422,6 +471,8 @@
           status: "{{ 'PASS' if qualifying else 'FAIL' }}"
           suitable: "{{ ['/dev/sdb'] if qualifying else [] }}"
           undersized: "{{ [] if qualifying else ['/dev/sdb'] }}"
+          unused: ['/dev/sdb']
+          capacity_gb: 21.47
           rejected: ['/dev/sda']
           report: "REJECTED /dev/sda 34.36 GB os-disk; UNDERSIZED /dev/sdb 21.47 GB"
       loop:
@@ -439,6 +490,24 @@
           - (basel_longhorn_cases | selectattr('name', 'equalto', 'lab-20gb') | map(attribute='suitable') | first) == ['/dev/sdb']
           - (basel_longhorn_cases | selectattr('name', 'equalto', 'production-500gb') | map(attribute='report') | first) is search('/dev/sda.*34.36 GB')
           - (basel_longhorn_cases | selectattr('name', 'equalto', 'production-500gb') | map(attribute='report') | first) is search('/dev/sdb.*21.47 GB')
+
+    - name: Assert lab disk evidence includes path, capacity, and unused state
+      ansible.builtin.assert:
+        that:
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'lab-20gb') | map(attribute='suitable') | first) == ['/dev/sdb']
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'lab-20gb') | map(attribute='report') | first) is search('/dev/sdb.*21.47 GB')
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'lab-20gb') | map(attribute='unused') | first) == ['/dev/sdb']
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'lab-20gb') | map(attribute='capacity_gb') | first) == 21.47
+
+    - name: Model prepared and mounted Longhorn discovery classifications
+      ansible.builtin.set_fact:
+        longhorn_discovery_report: "Unused/unprepared: /dev/sdb:21.47 GB; prepared/mounted: /dev/sdc:500 GB"
+
+    - name: Assert prepared and unused Longhorn disks remain distinguishable
+      ansible.builtin.assert:
+        that:
+          - "'Unused/unprepared: /dev/sdb:21.47 GB' in longhorn_discovery_report"
+          - "'prepared/mounted: /dev/sdc:500 GB' in longhorn_discovery_report"
 
     - name: Model memory remediation messages
       ansible.builtin.set_fact:

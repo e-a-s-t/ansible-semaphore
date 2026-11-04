@@ -1,7 +1,7 @@
 ---
 # Disk capacities use decimal GB, matching lsblk --bytes output.
 # Memory capacities use binary GiB because Linux reports memory in MiB.
-prerequisites_requirements:
+prerequisites_production_requirements:
   control_plane:
     vcpu: 4
     memory_gib: 8

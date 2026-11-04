@@ -7,6 +7,11 @@
     - ../vars/prerequisites.yml
 
   pre_tasks:
+    - name: Select validation profile and merge role requirements
+      ansible.builtin.set_fact:
+        prerequisites_active_profile: "{{ prerequisites_validation_profile | default('production') }}"
+        prerequisites_requirements: "{{ prerequisites_production_requirements | combine(prerequisites_requirement_overrides | default({}), recursive=True) }}"
+
     - name: Gather read-only system facts
       ansible.builtin.setup:
       register: prerequisites_setup
@@ -196,22 +201,28 @@
         prerequisites_longhorn_discovery_json: >-
           {% set suitable = [] %}
           {% set undersized = [] %}
+          {% set unused = [] %}
+          {% set prepared = [] %}
+          {% set mounted = [] %}
           {% set rejected = [] %}
           {% set complete = prerequisites_diag.get('longhorn_disks', {}).get('rc', 1) | int == 0 and prerequisites_root_disk_valid | bool %}
           {% for line in prerequisites_longhorn_discovery_lines %}
           {% set fields = line.split('\t') %}
           {% if fields | length >= 3 and fields[0] == 'UNUSED' and fields[2] is match('^[0-9]+$') %}
           {% set disk = {'device': fields[1], 'size_bytes': fields[2] | int, 'size_gb': ((fields[2] | int) / 1000000000) | round(2)} %}
+          {% set _ = unused.append(disk) %}
           {% if fields[2] | int >= (prerequisites_requirements.get(prerequisites_role, {}).get('data_disk_gb', 0) | int * 1000000000) %}
           {% set _ = suitable.append(disk) %}
           {% else %}
           {% set _ = undersized.append(disk) %}
           {% endif %}
           {% elif fields | length >= 4 and fields[0] == 'REJECT' %}
-          {% set _ = rejected.append({'device': fields[1], 'size_bytes': fields[2] | int if fields[2] is match('^[0-9]+$') else 0, 'reason': fields[3]}) %}
+          {% set disk = {'device': fields[1], 'size_bytes': fields[2] | int if fields[2] is match('^[0-9]+$') else 0, 'size_gb': (((fields[2] | int) / 1000000000) | round(2)) if fields[2] is match('^[0-9]+$') else 'unknown', 'reason': fields[3]} %}
+          {% set _ = rejected.append(disk) %}
+          {% if fields[3] == 'mounted' %}{% set _ = mounted.append(disk) %}{% else %}{% set _ = prepared.append(disk) %}{% endif %}
           {% endif %}
           {% endfor %}
-          {{ {'suitable': suitable, 'undersized': undersized, 'rejected': rejected, 'complete': complete} | to_json }}
+          {{ {'suitable': suitable, 'undersized': undersized, 'unused': unused, 'prepared': prepared, 'mounted': mounted, 'rejected': rejected, 'complete': complete} | to_json }}
     - name: Derive Longhorn storage validation
       ansible.builtin.set_fact:
         prerequisites_longhorn_validation_json: >-
@@ -235,6 +246,10 @@
           {% set mount_confirmed_invalid = mounted and ((mount_options is search('(^|,)bind(,|$)')) or not source is match('^/dev/') or source is search('\\[.*\\]') or os_backed or fstype not in prerequisites_longhorn_filesystems or not total_valid or not available_valid or capacity[0] | int < prerequisites_requirements.get(prerequisites_role, {}).get('data_disk_gb', 0) | int * 1000000000 or not persistent) %}
           {% set mount_incomplete = mounted and source is match('^/dev/') and (not mount_identity or not total_valid or not available_valid or not persistence_evidence) %}
           {% set discovery = prerequisites_longhorn_discovery_json | default('{}') | from_json %}
+          {% set unused_report = [] %}
+          {% set prepared_report = [] %}
+          {% for disk in discovery.unused %}{% set _ = unused_report.append(disk.device ~ ': ' ~ disk.size_gb ~ ' GB') %}{% endfor %}
+          {% for disk in discovery.prepared %}{% set _ = prepared_report.append(disk.device ~ ': ' ~ disk.size_gb ~ ' GB (' ~ disk.reason ~ ')') %}{% endfor %}
           {% set override = prerequisites_data_fields %}
           {% set override_configured = prerequisites_data_disk_device | default('') | trim | length > 0 %}
           {% set override_valid = override | length >= 3 and override[1] == 'disk' and override[2] is match('^[0-9]+$') %}
@@ -242,7 +257,7 @@
           {% set discovery_status = 'PASS' if discovery.suitable | length == 1 and discovery.complete else ('WARN' if discovery.suitable | length > 1 or not discovery.complete else 'FAIL') %}
           {% set status = 'SKIP' if prerequisites_role != 'worker' else ('FAIL' if mount_confirmed_invalid and not mount_incomplete else ('WARN' if mount_incomplete else 'PASS')) if mounted else ('PASS' if override_configured and override_valid and not override_os and override[2] | int >= prerequisites_requirements.get(prerequisites_role, {}).get('data_disk_gb', 0) | int * 1000000000 else ('FAIL' if override_configured and override_valid else ('WARN' if override_configured else discovery_status))) %}
           {% set incomplete = prerequisites_role == 'worker' and ((mounted and mount_incomplete) or (not mounted and override_configured and (not override_valid)) or (not mounted and not override_configured and (discovery.suitable | length > 1 or not discovery.complete))) %}
-          {% set actual = 'Not applicable' if prerequisites_role != 'worker' else ('Mounted ' ~ source ~ ' (' ~ fstype ~ '), ' ~ (capacity[0] | default('unknown')) ~ ' bytes total, ' ~ (capacity[1] | default('unknown')) ~ ' bytes available; persistent=' ~ ('yes' if persistent else 'no') if mounted else ('Override ' ~ prerequisites_data_disk_device ~ ', ' ~ (prerequisites_data_size_bytes | int / 1000000000) | round(2) ~ ' GB, evidence_valid=' ~ ('yes' if override_valid else 'no') if override_configured else ('Suitable: ' ~ (discovery.suitable | map(attribute='device') | join(', ')) ~ '; undersized: ' ~ (discovery.undersized | map(attribute='device') | join(', ')) ~ '; rejected: ' ~ (discovery.rejected | map(attribute='device') | join(', '))))) %}
+          {% set actual = 'Not applicable' if prerequisites_role != 'worker' else ('Mounted ' ~ source ~ ' (' ~ fstype ~ '), ' ~ (capacity[0] | default('unknown')) ~ ' bytes total, ' ~ (capacity[1] | default('unknown')) ~ ' bytes available; persistent=' ~ ('yes' if persistent else 'no') if mounted else ('Override ' ~ prerequisites_data_disk_device ~ ', ' ~ (prerequisites_data_size_bytes | int / 1000000000) | round(2) ~ ' GB, evidence_valid=' ~ ('yes' if override_valid else 'no') if override_configured else ('Unused/unprepared: ' ~ (unused_report | join(', ') if unused_report else 'none') ~ '; prepared/mounted: ' ~ (prepared_report | join(', ') if prepared_report else 'none') ~ '; suitable: ' ~ (discovery.suitable | map(attribute='device') | join(', ')) ~ '; undersized: ' ~ (discovery.undersized | map(attribute='device') | join(', ')) ~ '; rejected: ' ~ (discovery.rejected | map(attribute='device') | join(', '))))) %}
           {% set explanation = 'Longhorn storage is not applicable to this role.' if prerequisites_role != 'worker' else ('Verify the mounted filesystem source, capacity, available space, and persistent configuration.' if mounted else ('The configured override is invalid or resolves to an unsuitable device.' if override_configured else ('Use prerequisites_data_disk_device to select one suitable disk.' if discovery.suitable | length > 1 else ('No unused disk meets the configured minimum capacity.' if discovery.complete and discovery.suitable | length == 0 else 'Automatic disk discovery evidence is incomplete.')))) %}
           {{ {'status': status, 'incomplete': incomplete, 'actual': actual, 'explanation': explanation, 'evidence_verified': status in ['PASS', 'FAIL']} | to_json }}
 
@@ -276,10 +291,10 @@
         disk_name: "{{ prerequisites_root_disk_raw.split()[0] | default('unknown') }}"
         disk_valid: "{{ prerequisites_root_disk_raw is match('^[^ ]+[ ]+disk[ ]+[0-9]+$') }}"
         storage_items:
-          - { section: STORAGE, name: OS disk, status: "{{ 'PASS' if disk_valid and disk_size | int >= req.get('os_disk_gb', 0) | int * 1000000000 else ('FAIL' if disk_valid else 'WARN') }}", actual: "{{ ((disk_size | int) / 1000000000) | round(2) }} GB provisioned on {{ disk_name if disk_valid else 'unknown disk' }}", required: "{{ req.get('os_disk_gb', 'unknown') }} GB provisioned", explanation: "{{ '' if disk_valid and disk_size | int >= req.get('os_disk_gb', 0) | int * 1000000000 else ('Increase the provisioned OS disk.' if disk_valid else 'Underlying disk cannot be identified reliably; verify VM storage. An unmounted disk is not inferred safe.') }}", owner: Infrastructure }
+          - { section: STORAGE, name: OS disk, status: "{{ 'PASS' if disk_valid and disk_size | int >= req.get('os_disk_gb', 0) | int * 1000000000 else ('FAIL' if disk_valid else 'WARN') }}", actual: "{{ ((disk_size | int) / 1000000000) | round(2) }} GB provisioned on {{ disk_name if disk_valid else 'unknown disk' }}", required: "{{ req.get('os_disk_gb', 'unknown') }} GB provisioned", explanation: "{{ '' if disk_valid and disk_size | int >= req.get('os_disk_gb', 0) | int * 1000000000 else ('Increase the provisioned OS disk.' if disk_valid else 'Underlying disk cannot be identified reliably; verify VM storage. An unmounted disk is not inferred safe.') }}", owner: Infrastructure, action_key: os-disk }
           - { section: STORAGE, name: Root partition/device, status: "{{ 'PASS' if prerequisites_root_partition_valid else 'WARN' }}", actual: "{{ (((prerequisites_root_partition_raw | int) / 1000000000) | round(2) ~ ' GB') if prerequisites_root_partition_valid else 'unknown' }}", required: Root device present, explanation: "Root partition or logical-volume size is unavailable.", owner: Validation }
           - { section: STORAGE, name: Root filesystem, status: "{{ 'PASS' if prerequisites_root_filesystem_valid and prerequisites_root_available_valid else 'WARN' }}", actual: "{{ (((prerequisites_root_filesystem_raw | int) / 1000000000) | round(2) ~ ' GB cap / ' ~ ((prerequisites_root_available_raw | int) / 1000000000) | round(2) ~ ' GB free') if prerequisites_root_filesystem_valid and prerequisites_root_available_valid else 'unknown' }}", required: Mounted filesystem available, explanation: "Root filesystem capacity or available space is unavailable.", owner: Validation }
-          - { section: STORAGE, name: Dedicated role data disk, status: "{{ prerequisites_longhorn_validation.status if prerequisites_role == 'worker' else ('SKIP' if prerequisites_role == 'control_plane' else ('WARN' if prerequisites_data_disk_device | default('') | trim == '' or not prerequisites_data_valid else ('PASS' if prerequisites_data_size_bytes | int >= req.get('data_disk_gb', 0) | int * 1000000000 else 'FAIL'))) }}", actual: "{{ prerequisites_longhorn_validation.actual if prerequisites_role == 'worker' else ('Not required' if prerequisites_role == 'control_plane' else (prerequisites_data_disk_device if prerequisites_data_disk_device | default('') | trim == '' else (((prerequisites_data_size_bytes | int) / 1000000000) | round(2) ~ ' GB on ' ~ (prerequisites_data_fields[0] | default('unknown')) ~ ' (' ~ (prerequisites_data_fields[3] | default('unformatted')) ~ ')'))) }}", required: "{{ req.get('data_disk_gb', 'unknown') }} GB dedicated device", explanation: "{{ prerequisites_longhorn_validation.explanation if prerequisites_role == 'worker' else ('Configure an explicit dedicated disk; it may remain unformatted and unmounted.' if prerequisites_role == 'backup' and (prerequisites_data_disk_device | default('') | trim == '' or not prerequisites_data_valid) else ('Increase the configured dedicated data disk.' if prerequisites_role == 'backup' and prerequisites_data_valid and prerequisites_data_size_bytes | int < req.get('data_disk_gb', 0) | int * 1000000000 else '')) }}", owner: Infrastructure }
+          - { section: STORAGE, name: Dedicated role data disk, status: "{{ prerequisites_longhorn_validation.status if prerequisites_role == 'worker' else ('SKIP' if prerequisites_role == 'control_plane' else ('WARN' if prerequisites_data_disk_device | default('') | trim == '' or not prerequisites_data_valid else ('PASS' if prerequisites_data_size_bytes | int >= req.get('data_disk_gb', 0) | int * 1000000000 else 'FAIL'))) }}", actual: "{{ prerequisites_longhorn_validation.actual if prerequisites_role == 'worker' else ('Not required' if prerequisites_role == 'control_plane' else (prerequisites_data_disk_device if prerequisites_data_disk_device | default('') | trim == '' else (((prerequisites_data_size_bytes | int) / 1000000000) | round(2) ~ ' GB on ' ~ (prerequisites_data_fields[0] | default('unknown')) ~ ' (' ~ (prerequisites_data_fields[3] | default('unformatted')) ~ ')'))) }}", required: "{{ req.get('data_disk_gb', 'unknown') }} GB dedicated device", explanation: "{{ prerequisites_longhorn_validation.explanation if prerequisites_role == 'worker' else ('Configure an explicit dedicated disk; it may remain unformatted and unmounted.' if prerequisites_role == 'backup' and (prerequisites_data_disk_device | default('') | trim == '' or not prerequisites_data_valid) else ('Increase the configured dedicated data disk.' if prerequisites_role == 'backup' and prerequisites_data_valid and prerequisites_data_size_bytes | int < req.get('data_disk_gb', 0) | int * 1000000000 else '')) }}", owner: Infrastructure, action_key: dedicated-role-data-disk }
 
     - name: Validate networking
       ansible.builtin.set_fact:
@@ -359,7 +374,7 @@
           - { section: LONGHORN, name: iSCSI initiator tools, status: "{{ 'SKIP' if prerequisites_role != 'worker' else ('PASS' if prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int == 0 and prerequisites_diag.get('iscsid', {}).get('rc', 1) | int == 0 else 'WARN') }}", actual: "{{ 'Not applicable' if prerequisites_role != 'worker' else ('Available' if prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int == 0 and prerequisites_diag.get('iscsid', {}).get('rc', 1) | int == 0 else 'Missing; Carekube can install it') }}", required: iscsiadm and iscsid for V1, explanation: "{{ 'Carekube can install and enable open-iscsi during Longhorn preparation.' if prerequisites_role == 'worker' else '' }}", owner: Carekube }
           - { section: LONGHORN, name: iSCSI kernel capability, status: "{{ 'SKIP' if prerequisites_role != 'worker' else ('PASS' if 'iscsi_tcp' in modules or 'CONFIG_ISCSI_TCP=y' in kernel_config else 'WARN') }}", actual: "{{ 'Not applicable' if prerequisites_role != 'worker' else ('Loaded' if 'iscsi_tcp' in modules else ('Built-in' if 'CONFIG_ISCSI_TCP=y' in kernel_config else ('Available but unloaded' if 'iscsi_tcp AVAILABLE=' in module_files else 'Unavailable or unverifiable'))) }}", required: iscsi_tcp loaded or built-in, explanation: "{{ 'Carekube can load or configure iscsi_tcp during installation.' if prerequisites_role == 'worker' and 'iscsi_tcp' not in modules and 'CONFIG_ISCSI_TCP=y' not in kernel_config else '' }}", owner: Carekube }
           - { section: LONGHORN, name: Filesystem utilities, status: "{{ 'SKIP' if prerequisites_role != 'worker' else ('PASS' if prerequisites_diag.get('longhorn_utilities', {}).get('stdout_lines', []) | length >= 2 else 'WARN') }}", actual: "{{ 'Not applicable' if prerequisites_role != 'worker' else (prerequisites_diag.get('longhorn_utilities', {}).get('stdout', 'Missing; Carekube can install them') | trim) }}", required: ext4/XFS and storage utilities, explanation: "{{ 'Carekube can install missing filesystem utilities.' if prerequisites_role == 'worker' else '' }}", owner: Carekube }
-          - { section: LONGHORN, name: Data path, status: "{{ prerequisites_longhorn_validation.status }}", actual: "{{ prerequisites_longhorn_validation.actual }}", explanation: "{{ prerequisites_longhorn_validation.explanation }}", incomplete: "{{ prerequisites_longhorn_validation.incomplete }}", evidence_verified: "{{ prerequisites_longhorn_validation.evidence_verified }}", required: Dedicated Longhorn disk identity, capacity, and persistent mount, owner: Infrastructure }
+          - { section: LONGHORN, name: Data path, status: "{{ prerequisites_longhorn_validation.status }}", actual: "{{ prerequisites_longhorn_validation.actual }}", explanation: "{{ prerequisites_longhorn_validation.explanation }}", incomplete: "{{ prerequisites_longhorn_validation.incomplete }}", evidence_verified: "{{ prerequisites_longhorn_validation.evidence_verified }}", required: Dedicated Longhorn disk identity, capacity, and persistent mount, owner: Infrastructure, action_key: dedicated-role-data-disk }
 
     - name: Validate configured network endpoints
       ansible.builtin.set_fact:
@@ -398,6 +413,8 @@
           RKE2 PREREQUISITES — {{ ansible_facts.hostname | default(inventory_hostname) }}
           Inventory: {{ inventory_hostname }}
           Role: {{ prerequisites_role }} | OS: {{ ansible_facts.distribution | default('Unknown') }} {{ ansible_facts.distribution_version | default('unknown') }}
+          Validation profile: {{ prerequisites_active_profile }}
+          Requirements: {{ prerequisites_requirements.get(prerequisites_role, {}) }}
 
           OVERALL READINESS: {{ prerequisites_readiness }}
           {{ 'Confirmed infrastructure blockers prevent installation.' if prerequisites_readiness == 'NOT READY' else ('Mandatory infrastructure evidence is incomplete; no confirmed blocker was found.' if prerequisites_readiness == 'INCOMPLETE' else 'Infrastructure readiness is verified; Carekube installation tasks may remain.') }}
@@ -410,10 +427,11 @@
 
           ACTION REQUIRED — INFRASTRUCTURE BLOCKERS
           ------------------------------------------------------------------------
-          {% for result in prerequisites_results if result.status == 'FAIL' %}- {{ result.status }} — {{ result.owner | default('Validation') }} — {{ result.name | default('Check') }}
+          {% set emitted = namespace(keys=[]) %}
+          {% for result in prerequisites_results if result.status == 'FAIL' %}{% set action_key = result.action_key | default(result.section ~ ':' ~ result.name) %}{% if action_key not in emitted.keys %}{% set _ = emitted.keys.append(action_key) %}- {{ result.status }} — {{ result.owner | default('Validation') }} — {{ result.name | default('Check') }}
           Evidence: {{ result.evidence | default(result.actual | default('Unavailable')) }}
           Remediation: {{ result.explanation | default('Review this diagnostic.') }}
-          {% endfor %}
+          {% endif %}{% endfor %}
 
           ACTION REQUIRED — CAREKUBE INSTALLATION TASKS
           ------------------------------------------------------------------------
