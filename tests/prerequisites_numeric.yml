@@ -329,6 +329,38 @@
           - missing_iscsi_actual != 'Loaded'
           - empty_data_path_actual == 'Not mounted; acceptable before installation'
 
+    - name: Classify Longhorn dedicated-disk evidence cases
+      ansible.builtin.set_fact:
+        longhorn_disk_cases: "{{ longhorn_disk_cases | default([]) + [case_result] }}"
+      vars:
+        data_fields: "{{ item.evidence.split() }}"
+        data_valid: "{{ data_fields | length >= 3 and data_fields[1] == 'disk' and data_fields[2] is match('^[0-9]+$') }}"
+        data_size_bytes: "{{ data_fields[2] | default('0') | int }}"
+        configured: "{{ item.device | trim }}"
+        case_result:
+          name: "{{ item.name }}"
+          status: "{{ 'SKIP' if item.role == 'control_plane' else ('PASS' if configured and data_valid and data_size_bytes >= item.required_gb * 1000000000 else ('FAIL' if configured and data_valid else 'WARN')) }}"
+          incomplete: "{{ item.role in ['worker', 'backup'] and (not configured or not data_valid) }}"
+      loop:
+        - { name: control-plane, role: control_plane, device: "", evidence: "", required_gb: 0 }
+        - { name: worker-missing, role: worker, device: "", evidence: "", required_gb: 500 }
+        - { name: worker-invalid, role: worker, device: /dev/sdb, evidence: "/dev/sdb disk not-a-size", required_gb: 500 }
+        - { name: worker-unformatted-unmounted, role: worker, device: /dev/sdb, evidence: "/dev/sdb disk 600000000000", required_gb: 500 }
+        - { name: worker-formatted-mounted, role: worker, device: /dev/sdb, evidence: "/dev/sdb disk 600000000000 ext4 /var/lib/longhorn", required_gb: 500 }
+        - { name: backup-valid, role: backup, device: /dev/sdc, evidence: "/dev/sdc disk 2000000000000", required_gb: 2000 }
+
+    - name: Assert Longhorn dedicated-disk regression cases
+      ansible.builtin.assert:
+        that:
+          - (longhorn_disk_cases | selectattr('name', 'equalto', 'control-plane') | map(attribute='status') | first) == 'SKIP'
+          - (longhorn_disk_cases | selectattr('name', 'equalto', 'worker-missing') | map(attribute='status') | first) == 'WARN'
+          - (longhorn_disk_cases | selectattr('name', 'equalto', 'worker-missing') | map(attribute='incomplete') | first | bool)
+          - (longhorn_disk_cases | selectattr('name', 'equalto', 'worker-invalid') | map(attribute='status') | first) == 'WARN'
+          - (longhorn_disk_cases | selectattr('name', 'equalto', 'worker-invalid') | map(attribute='incomplete') | first | bool)
+          - (longhorn_disk_cases | selectattr('name', 'equalto', 'worker-unformatted-unmounted') | map(attribute='status') | first) == 'PASS'
+          - (longhorn_disk_cases | selectattr('name', 'equalto', 'worker-formatted-mounted') | map(attribute='status') | first) == 'PASS'
+          - (longhorn_disk_cases | selectattr('name', 'equalto', 'backup-valid') | map(attribute='status') | first) == 'PASS'
+
     - name: Model verified versus unverified readiness evidence
       ansible.builtin.set_fact:
         verified_warning:
