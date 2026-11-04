@@ -1,0 +1,25 @@
+---
+# RKE2 installation settings. Override environment-specific values in
+# inventory/group vars or Semaphore extra vars; never commit the token.
+rke2_version: "v1.33.13+rke2r3"
+rke2_bootstrap_node: "basel-rke2-1"
+rke2_token_source_node: ""
+rke2_join_token: ""
+
+rke2_api_endpoint: "192.168.50.165"
+rke2_api_port: 6443
+rke2_registration_endpoint: "192.168.50.165"
+rke2_registration_port: 9345
+rke2_tls_sans: []
+
+rke2_cni: cilium
+rke2_disabled_components:
+  - rke2-ingress-nginx
+rke2_config_path: /etc/rancher/rke2/config.yaml
+rke2_data_dir: /var/lib/rancher/rke2
+rke2_managed_marker: /etc/rancher/rke2/.carekube-managed-config
+rke2_kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/carekube-rke2.yaml"
+rke2_token_backup_path: "{{ lookup('env', 'HOME') }}/.config/carekube/rke2/server-token"
+rke2_install_url: https://get.rke2.io
+rke2_api_wait_retries: 60
+rke2_api_wait_delay: 5

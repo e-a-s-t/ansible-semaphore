@@ -1,0 +1,462 @@
+---
+- name: Classify RKE2 installation state
+  hosts: control_plane:worker
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/rke2.yml
+  pre_tasks:
+    - name: Validate RKE2 inventory role
+      ansible.builtin.assert:
+        that:
+          - (group_names | intersect(['control_plane', 'worker']) | length) == 1
+        fail_msg: "{{ inventory_hostname }} must belong to exactly one of control_plane or worker."
+
+    - name: Validate explicit bootstrap node
+      ansible.builtin.assert:
+        that:
+          - rke2_bootstrap_node | length > 0
+          - rke2_bootstrap_node in groups['control_plane']
+        fail_msg: "rke2_bootstrap_node must name a control_plane host."
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Validate endpoint and version settings
+      ansible.builtin.assert:
+        that:
+          - rke2_version is match('^v[0-9]+\\.[0-9]+\\.[0-9]+.*\\+rke2r[0-9]+$')
+          - rke2_api_endpoint | length > 0
+          - rke2_registration_endpoint | length > 0
+          - rke2_api_port | int > 0
+          - rke2_registration_port | int > 0
+          - rke2_cni == 'cilium'
+
+    - name: Inspect local RKE2 state
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /usr/local/bin/rke2
+        - "{{ rke2_config_path }}"
+        - "{{ rke2_data_dir }}"
+        - "{{ rke2_managed_marker }}"
+      register: rke2_state_paths
+      changed_when: false
+
+    - name: Read installed RKE2 version
+      ansible.builtin.command: /usr/local/bin/rke2 --version
+      register: rke2_version_command
+      changed_when: false
+      failed_when: false
+      when: rke2_state_paths.results[0].stat.exists
+
+    - name: Read managed configuration marker
+      ansible.builtin.slurp:
+        src: "{{ rke2_managed_marker }}"
+      register: rke2_marker_content
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when: rke2_state_paths.results[3].stat.exists
+
+    - name: Read existing configuration without exposing secrets
+      ansible.builtin.slurp:
+        src: "{{ rke2_config_path }}"
+      register: rke2_existing_config
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when: rke2_state_paths.results[1].stat.exists
+
+    - name: Derive managed RKE2 configuration
+      ansible.builtin.set_fact:
+        rke2_is_control_plane: "{{ 'control_plane' in group_names }}"
+        rke2_is_bootstrap: "{{ inventory_hostname == rke2_bootstrap_node }}"
+        rke2_effective_sans: "{{ ([rke2_api_endpoint] + (rke2_tls_sans | default([]))) | unique }}"
+        rke2_expected_config: >-
+          {{ ({
+            'cni': rke2_cni,
+            'disable': rke2_disabled_components,
+            'tls-san': ([rke2_api_endpoint] + (rke2_tls_sans | default([]))) | unique
+          }
+          | combine(({ 'cluster-init': true } if (inventory_hostname == rke2_bootstrap_node) else
+                    { 'server': 'https://' ~ rke2_registration_endpoint ~ ':' ~ (rke2_registration_port | string) }))) }}
+      no_log: true
+
+    - name: Parse existing configuration and classify state
+      ansible.builtin.set_fact:
+        rke2_current_config: "{{ (rke2_existing_config.content | default('') | b64decode | from_yaml) if rke2_existing_config is defined and rke2_existing_config.content is defined else {} }}"
+        rke2_installed_version: "{{ (rke2_version_command.stdout | default('') | regex_search('v[0-9]+\\.[0-9]+\\.[0-9]+[^ ]*')) | default('') }}"
+        rke2_has_installation: "{{ rke2_state_paths.results[0].stat.exists or rke2_state_paths.results[2].stat.exists }}"
+      no_log: true
+
+    - name: Determine managed configuration drift
+      ansible.builtin.set_fact:
+        rke2_config_drift: >-
+          {{ rke2_has_installation and (
+             (rke2_installed_version | length > 0 and rke2_installed_version != rke2_version) or
+             (rke2_state_paths.results[3].stat.exists and
+              (rke2_marker_content.content | b64decode | trim) != (rke2_expected_config | to_nice_json)) or
+             (rke2_state_paths.results[1].stat.exists and
+              (rke2_current_config.get('cni', rke2_cni) != rke2_cni or
+               rke2_current_config.get('disable', rke2_disabled_components) != rke2_disabled_components or
+               (inventory_hostname != rke2_bootstrap_node and rke2_current_config.get('server', '') != ('https://' ~ rke2_registration_endpoint ~ ':' ~ (rke2_registration_port | string))) or
+               ((rke2_current_config.get('tls-san', rke2_effective_sans) | sort) != (rke2_effective_sans | sort))))
+             ) }}
+        rke2_state: >-
+          {{ 'new' if not rke2_has_installation else
+             ('drifted' if rke2_config_drift else
+              ('matching' if rke2_state_paths.results[3].stat.exists else 'unknown')) }}
+      no_log: true
+
+    - name: Refuse unsafe existing state before mutation
+      ansible.builtin.assert:
+        that:
+          - rke2_state not in ['drifted', 'unknown']
+        fail_msg: >-
+          {{ inventory_hostname }} has {{ rke2_state }} RKE2 state. Existing nodes are not
+          modified automatically; review configuration and cluster identity before retrying.
+
+- name: Bootstrap or preserve the explicit bootstrap node
+  hosts: control_plane
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/rke2.yml
+  tasks:
+    - name: Ensure RKE2 configuration directory exists for a new bootstrap
+      ansible.builtin.file:
+        path: "{{ rke2_config_path | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state == 'new'
+
+    - name: Install RKE2 server on a new bootstrap
+      ansible.builtin.shell: >-
+        curl -sfL {{ rke2_install_url | quote }} |
+        INSTALL_RKE2_VERSION={{ rke2_version | quote }} INSTALL_RKE2_TYPE=server sh -
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/rke2
+      environment:
+        INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+        INSTALL_RKE2_TYPE: server
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state == 'new'
+      no_log: true
+
+    - name: Configure a new embedded-etcd bootstrap server
+      ansible.builtin.copy:
+        dest: "{{ rke2_config_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          cluster-init: true
+          cni: {{ rke2_cni }}
+          disable:
+          {% for component in rke2_disabled_components %}  - {{ component }}
+          {% endfor %}tls-san:
+          {% for san in ([rke2_api_endpoint] + (rke2_tls_sans | default([]))) | unique %}  - {{ san }}
+          {% endfor %}{% if rke2_join_token | trim | length > 0 %}token: {{ rke2_join_token }}
+          {% endif %}
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state == 'new'
+      no_log: true
+      register: rke2_bootstrap_config
+
+    - name: Start and enable a new bootstrap server
+      ansible.builtin.service:
+        name: rke2-server
+        state: started
+        enabled: true
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state == 'new'
+
+    - name: Wait for the bootstrap token
+      ansible.builtin.shell: >-
+        test -r {{ rke2_data_dir | quote }}/server/node-token ||
+        test -r {{ rke2_data_dir | quote }}/server/token
+      args:
+        executable: /bin/bash
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state == 'new'
+      register: rke2_token_wait
+      retries: 60
+      delay: 5
+      until: rke2_token_wait.rc == 0
+      changed_when: false
+      no_log: true
+
+    - name: Record managed bootstrap configuration
+      ansible.builtin.copy:
+        content: "{{ rke2_expected_config | to_nice_json }}"
+        dest: "{{ rke2_managed_marker }}"
+        owner: root
+        group: root
+        mode: '0600'
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state == 'new'
+      no_log: true
+
+- name: Acquire and protect the cluster token on the controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../vars/rke2.yml
+  vars:
+    rke2_selected_token_source: "{{ rke2_token_source_node | trim if rke2_token_source_node | trim else rke2_bootstrap_node }}"
+  tasks:
+    - name: Validate token source selection
+      ansible.builtin.assert:
+        that:
+          - rke2_selected_token_source in groups['control_plane']
+          - hostvars[rke2_selected_token_source].rke2_state in ['new', 'matching']
+        fail_msg: "rke2_token_source_node must name a control-plane host."
+
+    - name: Read the existing or newly generated server token
+      ansible.builtin.shell: >-
+        for token_path in {{ rke2_data_dir | quote }}/server/node-token {{ rke2_data_dir | quote }}/server/token; do
+          if [ -r "$token_path" ]; then cat "$token_path"; exit 0; fi;
+        done;
+        exit 1
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ rke2_selected_token_source }}"
+      register: rke2_token_read
+      changed_when: false
+      no_log: true
+
+    - name: Preserve token in controller memory
+      ansible.builtin.set_fact:
+        rke2_cluster_token: "{{ rke2_token_read.stdout | trim }}"
+      no_log: true
+
+    - name: Create protected token backup directory
+      ansible.builtin.file:
+        path: "{{ rke2_token_backup_path | dirname }}"
+        state: directory
+        mode: '0700'
+
+    - name: Back up the cluster token outside the cluster
+      ansible.builtin.copy:
+        content: "{{ rke2_cluster_token }}\n"
+        dest: "{{ rke2_token_backup_path }}"
+        mode: '0600'
+      no_log: true
+
+- name: Join additional control-plane nodes
+  hosts: control_plane
+  serial: 1
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/rke2.yml
+  tasks:
+    - name: Install RKE2 server on a new control-plane node
+      ansible.builtin.shell: >-
+        curl -sfL {{ rke2_install_url | quote }} |
+        INSTALL_RKE2_VERSION={{ rke2_version | quote }} INSTALL_RKE2_TYPE=server sh -
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/rke2
+      environment:
+        INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+        INSTALL_RKE2_TYPE: server
+      when:
+        - inventory_hostname != rke2_bootstrap_node
+        - rke2_state == 'new'
+      no_log: true
+
+    - name: Configure a new joining control-plane node
+      ansible.builtin.copy:
+        dest: "{{ rke2_config_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          server: https://{{ rke2_registration_endpoint }}:{{ rke2_registration_port }}
+          token: {{ hostvars['localhost']['rke2_cluster_token'] }}
+          cni: {{ rke2_cni }}
+          disable:
+          {% for component in rke2_disabled_components %}  - {{ component }}
+          {% endfor %}tls-san:
+          {% for san in ([rke2_api_endpoint] + (rke2_tls_sans | default([]))) | unique %}  - {{ san }}
+          {% endfor %}
+      when:
+        - inventory_hostname != rke2_bootstrap_node
+        - rke2_state == 'new'
+      no_log: true
+
+    - name: Start a new joining control-plane node
+      ansible.builtin.service:
+        name: rke2-server
+        state: started
+        enabled: true
+      when:
+        - inventory_hostname != rke2_bootstrap_node
+        - rke2_state == 'new'
+
+    - name: Record managed joining control-plane configuration
+      ansible.builtin.copy:
+        content: "{{ rke2_expected_config | to_nice_json }}"
+        dest: "{{ rke2_managed_marker }}"
+        owner: root
+        group: root
+        mode: '0600'
+      when:
+        - inventory_hostname != rke2_bootstrap_node
+        - rke2_state == 'new'
+      no_log: true
+
+- name: Join worker nodes
+  hosts: worker
+  serial: 1
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/rke2.yml
+  tasks:
+    - name: Install RKE2 agent on a new worker
+      ansible.builtin.shell: >-
+        curl -sfL {{ rke2_install_url | quote }} |
+        INSTALL_RKE2_VERSION={{ rke2_version | quote }} INSTALL_RKE2_TYPE=agent sh -
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/rke2
+      environment:
+        INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+        INSTALL_RKE2_TYPE: agent
+      when: rke2_state == 'new'
+      no_log: true
+
+    - name: Configure a new worker agent
+      ansible.builtin.copy:
+        dest: "{{ rke2_config_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          server: https://{{ rke2_registration_endpoint }}:{{ rke2_registration_port }}
+          token: {{ hostvars['localhost']['rke2_cluster_token'] }}
+      when: rke2_state == 'new'
+      no_log: true
+
+    - name: Start a new worker agent
+      ansible.builtin.service:
+        name: rke2-agent
+        state: started
+        enabled: true
+      when: rke2_state == 'new'
+
+    - name: Record managed worker configuration
+      ansible.builtin.copy:
+        content: "{{ rke2_expected_config | to_nice_json }}"
+        dest: "{{ rke2_managed_marker }}"
+        owner: root
+        group: root
+        mode: '0600'
+      when: rke2_state == 'new'
+      no_log: true
+
+- name: Verify API and extract kubeconfig
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../vars/rke2.yml
+  tasks:
+    - name: Wait for the Kubernetes API endpoint
+      ansible.builtin.uri:
+        url: "https://{{ rke2_api_endpoint }}:{{ rke2_api_port }}/version"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401, 403]
+      register: rke2_api_check
+      retries: "{{ rke2_api_wait_retries }}"
+      delay: "{{ rke2_api_wait_delay }}"
+      until: rke2_api_check.status in [200, 401, 403]
+
+    - name: Verify registered Kubernetes nodes from a healthy control-plane member
+      ansible.builtin.command: >-
+        /usr/local/bin/rke2 kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        get nodes --no-headers
+      delegate_to: "{{ rke2_token_source_node | trim if rke2_token_source_node | trim else rke2_bootstrap_node }}"
+      register: rke2_registered_nodes
+      changed_when: false
+      no_log: true
+      failed_when: rke2_registered_nodes.rc != 0
+
+    - name: Require all inventory nodes to be represented in the API
+      ansible.builtin.assert:
+        that:
+          - (rke2_registered_nodes.stdout_lines | length) >= (groups['control_plane'] | length + groups['worker'] | length)
+        fail_msg: "The Kubernetes API did not report all expected control-plane and worker nodes."
+      no_log: true
+
+    - name: Read admin kubeconfig from the selected healthy control-plane member
+      ansible.builtin.slurp:
+        src: /etc/rancher/rke2/rke2.yaml
+      delegate_to: "{{ rke2_token_source_node | trim if rke2_token_source_node | trim else rke2_bootstrap_node }}"
+      register: rke2_kubeconfig_source
+      no_log: true
+
+    - name: Create protected kubeconfig directory
+      ansible.builtin.file:
+        path: "{{ rke2_kubeconfig_path | dirname }}"
+        state: directory
+        mode: '0700'
+
+    - name: Extract kubeconfig with external API endpoint
+      ansible.builtin.copy:
+        content: >-
+          {{ (rke2_kubeconfig_source.content | b64decode)
+             | regex_replace('https://127\\.0\\.0\\.1:[0-9]+', 'https://' ~ rke2_api_endpoint ~ ':' ~ (rke2_api_port | string))
+             | regex_replace('https://localhost:[0-9]+', 'https://' ~ rke2_api_endpoint ~ ':' ~ (rke2_api_port | string)) }}
+        dest: "{{ rke2_kubeconfig_path }}"
+        mode: '0600'
+      no_log: true
+
+    - name: Report installation completion without secrets
+      ansible.builtin.debug:
+        msg: |
+          RKE2 INSTALLATION — COMPLETE
+          Bootstrap node: {{ rke2_bootstrap_node }}
+          API endpoint: {{ rke2_api_endpoint }}:{{ rke2_api_port }}
+          Registration endpoint: {{ rke2_registration_endpoint }}:{{ rke2_registration_port }}
+          CNI: {{ rke2_cni }}
+          Kubeconfig: {{ rke2_kubeconfig_path }} (0600)
+          Token: preserved and backed up outside the cluster
+
+- name: Report per-node RKE2 installation state
+  hosts: control_plane:worker
+  gather_facts: false
+  become: true
+  vars_files:
+    - ../vars/rke2.yml
+  tasks:
+    - name: Gather RKE2 service state
+      ansible.builtin.service_facts:
+
+    - name: Report node installation result without secrets
+      ansible.builtin.debug:
+        msg: >-
+          RKE2 NODE REPORT — {{ inventory_hostname }} |
+          role={{ 'control_plane' if 'control_plane' in group_names else 'worker' }} |
+          state={{ rke2_state }} |
+          action={{ 'preserved' if rke2_state == 'matching' else ('installed/joined' if rke2_state == 'new' else 'failed-safely') }} |
+          service={{ ('rke2-server.service' if 'control_plane' in group_names else 'rke2-agent.service') }}={{
+            ansible_facts.services.get('rke2-server.service', ansible_facts.services.get('rke2-agent.service', {})).state | default('unknown') }}

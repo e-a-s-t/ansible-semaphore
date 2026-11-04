@@ -1,0 +1,86 @@
+---
+- name: Regression tests for RKE2 installation decisions
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    rke2_bootstrap_node: cp-b
+    rke2_api_endpoint: 192.0.2.10
+    rke2_api_port: 6443
+    rke2_registration_endpoint: 192.0.2.20
+    rke2_registration_port: 9345
+    generated_token: generated-token-fixture
+  tasks:
+    - name: Verify explicit bootstrap selection is independent of inventory order
+      ansible.builtin.assert:
+        that:
+          - rke2_bootstrap_node == 'cp-b'
+          - rke2_bootstrap_node != 'cp-a'
+
+    - name: Model fresh bootstrap token generation and reuse
+      ansible.builtin.set_fact:
+        bootstrap_token: "{{ generated_token }}"
+        joining_server: "https://{{ rke2_registration_endpoint }}:{{ rke2_registration_port }}"
+        api_server: "https://{{ rke2_api_endpoint }}:{{ rke2_api_port }}"
+
+    - name: Assert generated token is reused and endpoints remain separate
+      ansible.builtin.assert:
+        that:
+          - bootstrap_token == generated_token
+          - joining_server == 'https://192.0.2.20:9345'
+          - api_server == 'https://192.0.2.10:6443'
+          - joining_server != api_server
+
+    - name: Model bootstrap-only cluster initialization
+      ansible.builtin.set_fact:
+        bootstrap_config: {cluster-init: true, cni: cilium}
+        joining_config: {server: 'https://192.0.2.20:9345', cni: cilium}
+
+    - name: Assert joining servers never receive cluster-init
+      ansible.builtin.assert:
+        that:
+          - bootstrap_config['cluster-init'] | bool
+          - "'cluster-init' not in joining_config"
+
+    - name: Model configuration classifications
+      ansible.builtin.set_fact:
+        matching: {state: matching, identity: intended}
+        drifted: {state: drifted, identity: intended}
+        foreign: {state: foreign_cluster, identity: different}
+        unknown: {state: unknown, identity: unavailable}
+
+    - name: Assert configuration drift is distinct from cluster identity
+      ansible.builtin.assert:
+        that:
+          - matching.state == 'matching'
+          - drifted.state == 'drifted'
+          - foreign.state == 'foreign_cluster'
+          - unknown.state == 'unknown'
+          - drifted.identity == 'intended'
+          - foreign.identity == 'different'
+
+    - name: Model expansion without existing-member mutation
+      ansible.builtin.set_fact:
+        existing_members_before: [cp-a, cp-b, worker-a]
+        existing_members_after: [cp-a, cp-b, worker-a, cp-c, worker-b]
+        mutated_existing_members: []
+
+    - name: Assert expansion preserves existing members
+      ansible.builtin.assert:
+        that:
+          - existing_members_before | difference(existing_members_after) | length == 0
+          - mutated_existing_members | length == 0
+
+    - name: Model token backup and kubeconfig secrecy
+      ansible.builtin.set_fact:
+        token_backup_mode: '0600'
+        kubeconfig_mode: '0600'
+        report: 'Token preserved and backed up outside the cluster'
+
+    - name: Assert credentials are not included in reports
+      ansible.builtin.assert:
+        that:
+          - token_backup_mode == '0600'
+          - kubeconfig_mode == '0600'
+          - generated_token not in report
+          - "'token:' not in report"

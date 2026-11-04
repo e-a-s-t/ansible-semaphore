@@ -1,6 +1,6 @@
-# Ansible Semaphore Connectivity and RKE2 Validation
+# Ansible Semaphore Connectivity, RKE2 Validation, and Installation
 
-Read-only Ansible content for verifying Semaphore connectivity and validating whether Linux VMs are suitable for a future RKE2 installation.
+Ansible content for verifying Semaphore connectivity, validating Linux VMs, preparing nodes, and installing an idempotent RKE2 cluster.
 
 ## Repository structure
 
@@ -13,9 +13,12 @@ ansible-semaphore/
 │       └── hosts.yml
 ├── playbooks/
 │   ├── connectivity.yml
-│   └── prerequisites.yml
+│   ├── prerequisites.yml
+│   ├── prepare-nodes.yml
+│   └── install-rke2.yml
 ├── vars/
-│   └── prerequisites.yml
+│   ├── prerequisites.yml
+│   └── rke2.yml
 └── .gitignore
 ```
 
@@ -95,6 +98,48 @@ ansible-playbook -i inventories/lab/hosts.yml playbooks/connectivity.yml
 The playbook does not gather facts during the initial connection step. It first runs `ansible.builtin.ping`, then explicitly runs `ansible.builtin.setup` and displays basic system information. It does not use sudo, root privileges, or modifying modules.
 
 ## Semaphore configuration
+
+## Installation workflow
+
+Run the stages in this order:
+
+```text
+connectivity.yml -> prerequisites.yml -> prepare-nodes.yml -> install-rke2.yml
+```
+
+`install-rke2.yml` is intentionally separate from operating-system preparation and later platform components. It targets only `control_plane` and `worker` and requires root privileges.
+
+Configure `vars/rke2.yml` through inventory/group variables or Semaphore extra variables. Set `rke2_bootstrap_node` explicitly; inventory order is not used. Configure the Kubernetes API and RKE2 registration endpoints independently:
+
+```yaml
+rke2_bootstrap_node: basel-rke2-1
+rke2_api_endpoint: 192.168.50.165       # lab direct node IP or production F5 VIP
+rke2_api_port: 6443
+rke2_registration_endpoint: 192.168.50.165
+rke2_registration_port: 9345
+rke2_tls_sans: [192.168.50.165]
+```
+
+The first fresh server uses `cluster-init: true`. Joining control-plane nodes never use `cluster-init`; they join through the registration endpoint. An existing bootstrap node is detected and preserved, never reinitialized. Existing matching nodes are not rewritten or restarted during expansion. Drift or uncertain existing state fails safely for review.
+
+RKE2 generates the server token during a fresh bootstrap unless `rke2_join_token` is explicitly supplied. Existing-cluster expansion reads the existing token from `rke2_token_source_node`, or the bootstrap node by default. The playbook never rotates or regenerates an existing token. It stores a protected `0600` recovery copy on the Ansible controller; include that file in encrypted disaster-recovery backups and do not commit it.
+
+The playbook configures RKE2-managed Cilium and disables bundled `rke2-ingress-nginx`. It extracts the admin kubeconfig to `rke2_kubeconfig_path`, replaces the localhost API address with the configured API endpoint, and writes it with mode `0600`. Token and kubeconfig operations use hidden task logging.
+
+Run the installation template with:
+
+```bash
+ansible-playbook -i inventories/lab/hosts.yml playbooks/install-rke2.yml
+```
+
+For production, override the endpoint, SAN, bootstrap, and token-source variables in the Semaphore environment. Supply `rke2_join_token` only through Ansible Vault or a protected Semaphore extra variable when controlled bootstrap or recovery requires it.
+
+Local checks that do not contact target VMs:
+
+```bash
+ANSIBLE_LOCAL_TEMP=/private/tmp/ansible-local ansible-playbook -i inventories/lab/hosts.yml playbooks/install-rke2.yml --syntax-check
+ANSIBLE_LOCAL_TEMP=/private/tmp/ansible-local ansible-playbook tests/install_rke2.yml
+```
 
 Configure the two SSH authentication contexts independently in Semaphore's Key Store.
 
