@@ -40,6 +40,10 @@ prerequisites_memory_tolerance: 0.05
 # Example: prerequisites_data_disk_device: /dev/vdc
 prerequisites_data_disk_device: ""
 
+# Formatting an automatically selected worker disk is destructive and must be
+# explicitly authorized for the preparation playbook.
+prerequisites_allow_disk_format: false
+
 # Only explicitly configured endpoints are tested. Each item may contain:
 # name, host, port, and tls (true/false).
 prerequisites_network_endpoints: []

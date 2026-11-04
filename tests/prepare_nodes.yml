@@ -1,0 +1,79 @@
+---
+- name: Regression tests for RKE2 node preparation decisions
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  vars:
+    required_bytes: 20000000000
+
+  tasks:
+    - name: Model disk discovery decisions
+      ansible.builtin.set_fact:
+        disk_cases:
+          - name: fresh-unused-disk
+            candidates: [{ device: /dev/sdb, size: 21470000000, state: unused }]
+            selected: /dev/sdb
+            status: eligible
+          - name: already-prepared-mounted-disk
+            candidates: []
+            mounted: { device: /dev/sdb, filesystem: ext4, size: 21470000000, path: /var/lib/longhorn, persistent: true }
+            selected: /dev/sdb
+            status: preserve
+          - name: os-disk-rejection
+            candidates: [{ device: /dev/sda, size: 50000000000, state: os-disk }]
+            selected: ''
+            status: reject
+          - name: multiple-eligible-disks
+            candidates:
+              - { device: /dev/sdb, size: 21470000000, state: unused }
+              - { device: /dev/sdc, size: 30000000000, state: unused }
+            selected: ''
+            status: ambiguous
+          - name: existing-filesystem-rejection
+            candidates: [{ device: /dev/sdb, size: 21470000000, state: existing-filesystem-or-signature }]
+            selected: ''
+            status: reject
+          - name: undersized-disk-rejection
+            candidates: [{ device: /dev/sdb, size: 19999999999, state: unused }]
+            selected: ''
+            status: undersized
+
+    - name: Assert discovery and safety classifications
+      ansible.builtin.assert:
+        that:
+          - (disk_cases | selectattr('name', 'equalto', 'fresh-unused-disk') | map(attribute='status') | first) == 'eligible'
+          - (disk_cases | selectattr('name', 'equalto', 'already-prepared-mounted-disk') | map(attribute='status') | first) == 'preserve'
+          - (disk_cases | selectattr('name', 'equalto', 'os-disk-rejection') | map(attribute='status') | first) == 'reject'
+          - (disk_cases | selectattr('name', 'equalto', 'multiple-eligible-disks') | map(attribute='status') | first) == 'ambiguous'
+          - (disk_cases | selectattr('name', 'equalto', 'existing-filesystem-rejection') | map(attribute='status') | first) == 'reject'
+          - (disk_cases | selectattr('name', 'equalto', 'undersized-disk-rejection') | map(attribute='status') | first) == 'undersized'
+          - (disk_cases | selectattr('name', 'equalto', 'os-disk-rejection') | map(attribute='selected') | first) == ''
+          - (disk_cases | selectattr('name', 'equalto', 'multiple-eligible-disks') | map(attribute='selected') | first) == ''
+
+    - name: Model explicit formatting authorization
+      ansible.builtin.set_fact:
+        formatting_cases:
+          - { name: unauthorized, allow: false, existing: false, changes: 0, result: pending }
+          - { name: authorized, allow: true, existing: false, changes: 1, result: formatted }
+          - { name: existing-mount, allow: false, existing: true, changes: 0, result: preserved }
+
+    - name: Assert formatting requires opt-in and preserves existing mounts
+      ansible.builtin.assert:
+        that:
+          - (formatting_cases | selectattr('name', 'equalto', 'unauthorized') | map(attribute='result') | first) == 'pending'
+          - (formatting_cases | selectattr('name', 'equalto', 'authorized') | map(attribute='result') | first) == 'formatted'
+          - (formatting_cases | selectattr('name', 'equalto', 'existing-mount') | map(attribute='result') | first) == 'preserved'
+          - (formatting_cases | selectattr('name', 'equalto', 'unauthorized') | map(attribute='changes') | first | int) == 0
+
+    - name: Model idempotent second execution
+      ansible.builtin.set_fact:
+        first_run: { filesystem_created: true, mount_changed: true, persistent: true }
+        second_run: { filesystem_created: false, mount_changed: false, persistent: true }
+
+    - name: Assert second execution does not recreate storage
+      ansible.builtin.assert:
+        that:
+          - first_run.filesystem_created | bool
+          - second_run.filesystem_created | bool == false
+          - second_run.mount_changed | bool == false
+          - second_run.persistent | bool

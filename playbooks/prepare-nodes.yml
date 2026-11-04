@@ -1,0 +1,394 @@
+---
+- name: Prepare RKE2 and Longhorn node operating systems
+  hosts: proxmox2_targets
+  gather_facts: true
+  become: true
+  vars_files:
+    - ../vars/prerequisites.yml
+  vars:
+    prepare_nodes_common_packages:
+      - conntrack
+      - curl
+      - ebtables
+      - e2fsprogs
+      - ethtool
+      - iproute2
+      - iptables
+      - socat
+      - util-linux
+      - xfsprogs
+    prepare_nodes_worker_packages:
+      - nfs-common
+      - open-iscsi
+    prepare_nodes_kernel_modules:
+      - overlay
+      - br_netfilter
+    prepare_nodes_network_manager_conf: /etc/NetworkManager/conf.d/99-carekube-rke2-cni.conf
+    prepare_nodes_longhorn_mount: "{{ prerequisites_longhorn_data_path }}"
+
+  pre_tasks:
+    - name: Derive the inventory role
+      ansible.builtin.set_fact:
+        prepare_nodes_role_memberships: "{{ ['control_plane', 'worker', 'backup'] | select('in', group_names) | list }}"
+        prepare_nodes_role: "{{ (['control_plane', 'worker', 'backup'] | select('in', group_names) | list | first) | default('unknown', true) }}"
+        prerequisites_active_profile: "{{ prerequisites_validation_profile | default('production') }}"
+        prerequisites_requirements: "{{ prerequisites_production_requirements | combine(prerequisites_requirement_overrides | default({}), recursive=True) }}"
+
+    - name: Refuse invalid inventory role assignment
+      ansible.builtin.assert:
+        that:
+          - prepare_nodes_role_memberships | length == 1
+        fail_msg: "{{ inventory_hostname }} must belong to exactly one of control_plane, worker, or backup."
+
+    - name: Refuse unsupported operating systems before mutation
+      ansible.builtin.assert:
+        that:
+          - (ansible_facts.distribution == 'Ubuntu' and ansible_facts.distribution_version is version('24.04', '==')) or
+            (ansible_facts.distribution == 'Debian' and ansible_facts.distribution_version is version('13', '=='))
+        fail_msg: "Unsupported OS on {{ inventory_hostname }}: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}. Supported: Ubuntu 24.04 and Debian 13."
+
+    - name: Initialize preparation change tracking
+      ansible.builtin.set_fact:
+        prepare_nodes_changes: []
+
+  tasks:
+    - name: Install RKE2 operating-system requirements
+      ansible.builtin.apt:
+        name: "{{ prepare_nodes_common_packages + (prepare_nodes_worker_packages if prepare_nodes_role == 'worker' else []) }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      register: prepare_nodes_packages
+
+    - name: Disable active swap immediately
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      register: prepare_nodes_swapoff
+      changed_when: true
+
+    - name: Disable swap entries persistently
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([ \t]*[^#][^ \t]+[ \t]+[^ \t]+[ \t]+swap[ \t]+.*)$'
+        replace: '# disabled by Carekube prepare-nodes: \\1'
+        backup: false
+      register: prepare_nodes_fstab_swap
+
+    - name: Persist required kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/carekube-rke2.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: "{{ (prepare_nodes_kernel_modules + (['iscsi_tcp'] if prepare_nodes_role == 'worker' else [])) | join('\n') }}\n"
+      register: prepare_nodes_module_file
+
+    - name: Load required kernel modules
+      ansible.builtin.command: "modprobe {{ item }}"
+      loop: "{{ prepare_nodes_kernel_modules + (['iscsi_tcp'] if prepare_nodes_role == 'worker' else []) }}"
+      register: prepare_nodes_modprobe
+      changed_when: false
+
+    - name: Configure RKE2 kernel parameters
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-carekube-rke2.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+      register: prepare_nodes_sysctl_file
+
+    - name: Apply RKE2 kernel parameters immediately
+      ansible.builtin.command: sysctl --system
+      when: prepare_nodes_sysctl_file.changed
+      register: prepare_nodes_sysctl_apply
+      changed_when: true
+
+    - name: Detect NetworkManager
+      ansible.builtin.command: systemctl show NetworkManager.service --property=LoadState --value
+      register: prepare_nodes_network_manager
+      changed_when: false
+      failed_when: false
+
+    - name: Exclude CNI-managed interfaces from NetworkManager
+      ansible.builtin.copy:
+        dest: "{{ prepare_nodes_network_manager_conf }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by Carekube prepare-nodes. Keep CNI interfaces out of NetworkManager.
+          [keyfile]
+          unmanaged-devices=interface-name:cni*;interface-name:cilium*;interface-name:flannel*;interface-name:lxc*;interface-name:vxlan.calico;interface-name:cali*
+      when: prepare_nodes_network_manager.stdout | trim == 'loaded'
+      register: prepare_nodes_network_manager_conf_result
+      notify: Reload NetworkManager
+
+    - name: Install and configure Longhorn worker dependencies
+      when: prepare_nodes_role == 'worker'
+      block:
+        - name: Detect installed iSCSI services
+          ansible.builtin.service_facts:
+
+        - name: Select the available iSCSI service
+          ansible.builtin.set_fact:
+            prepare_nodes_iscsi_service: "{{ 'iscsid' if 'iscsid.service' in ansible_facts.services else ('open-iscsi' if 'open-iscsi.service' in ansible_facts.services else '') }}"
+
+        - name: Enable and start iSCSI service
+          ansible.builtin.service:
+            name: "{{ prepare_nodes_iscsi_service }}"
+            enabled: true
+            state: started
+          when: prepare_nodes_iscsi_service | length > 0
+          register: prepare_nodes_iscsi_service_result
+
+    - name: Inspect the Longhorn mount and underlying disk
+      ansible.builtin.shell: |
+        set -o pipefail
+        path={{ prepare_nodes_longhorn_mount | quote }}
+        source=$(findmnt -n -o SOURCE --target "$path" 2>/dev/null || true)
+        fstype=$(findmnt -n -o FSTYPE --target "$path" 2>/dev/null || true)
+        options=$(findmnt -n -o OPTIONS --target "$path" 2>/dev/null || true)
+        disk=''
+        size=''
+        uuid=''
+        if [ -n "$source" ] && [ -b "$source" ]; then
+          disk=$(lsblk -s -rpnbo NAME,TYPE "$source" 2>/dev/null | awk '$2 == "disk" {d=$1} END {print d}')
+          size=$(lsblk -dnbo SIZE "$disk" 2>/dev/null || true)
+          uuid=$(blkid -s UUID -o value "$source" 2>/dev/null || true)
+        fi
+        printf 'MOUNT\t%s\t%s\t%s\t%s\t%s\t%s\n' "$source" "$fstype" "$options" "$disk" "$size" "$uuid"
+        root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+        root_disk=$(lsblk -s -npbo NAME,TYPE "$root_source" 2>/dev/null | awk '$2 == "disk" {print $1; exit}')
+        printf 'ROOT\t%s\n' "$root_disk"
+      args:
+        executable: /bin/bash
+      register: prepare_nodes_mount_inspection
+      changed_when: false
+      when: prepare_nodes_role == 'worker'
+
+    - name: Discover unused worker disks using prerequisite safety rules
+      ansible.builtin.shell: |
+        set +e
+        root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | xargs -r lsblk -s -npbo NAME,TYPE 2>/dev/null | awk '$2 == "disk" {print $1; exit}')
+        swap_devices=$(swapon --show=NAME --noheadings 2>/dev/null)
+        lsblk -dnbo PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS 2>/dev/null | while read -r path type size fstype mountpoint; do
+          [ "$type" = disk ] || continue
+          reason=''
+          child=$(lsblk -nrpbo NAME,TYPE,PKNAME "$path" 2>/dev/null | awk -v p="$path" '$1 != p {print; exit}')
+          signature=$(blkid -p -o export "$path" 2>/dev/null | sed -n 's/^TYPE=//p' | head -n 1)
+          if [ "$path" = "$root_disk" ]; then reason=os-disk
+          elif [ -n "$child" ]; then reason=partitions-or-mapped-children
+          elif [ "$mountpoint" != "-" ] && [ -n "$mountpoint" ]; then reason=mounted
+          elif printf '%s\n' "$swap_devices" | awk -v p="$path" '$1 == p {found=1} END {exit !found}'; then reason=swap
+          elif [ -n "$fstype" ] || [ -n "$signature" ]; then reason=existing-filesystem-or-signature
+          fi
+          if [ -n "$reason" ]; then printf 'REJECT\t%s\t%s\t%s\n' "$path" "$size" "$reason"
+          else printf 'UNUSED\t%s\t%s\n' "$path" "$size"; fi
+        done
+      args:
+        executable: /bin/bash
+      register: prepare_nodes_disk_discovery
+      changed_when: false
+      when: prepare_nodes_role == 'worker'
+
+    - name: Normalize worker storage evidence
+      ansible.builtin.set_fact:
+        prepare_nodes_mount_fields: "{{ (prepare_nodes_mount_inspection.stdout_lines | default([]) | select('match', '^MOUNT\\t') | list | first | default('') ).split('\t') }}"
+        prepare_nodes_root_disk: "{{ (prepare_nodes_mount_inspection.stdout_lines | default([]) | select('match', '^ROOT\\t') | list | first | default('ROOT\t') ).split('\t')[1] | default('') }}"
+        prepare_nodes_unused_disks: >-
+          {{ prepare_nodes_disk_discovery.stdout_lines | default([]) | select('match', '^UNUSED\\t') | map('split', '\t') | map('list') | list }}
+        prepare_nodes_rejected_disks: >-
+          {{ prepare_nodes_disk_discovery.stdout_lines | default([]) | select('match', '^REJECT\\t') | map('split', '\t') | map('list') | list }}
+      when: prepare_nodes_role == 'worker'
+
+    - name: Determine the selected Longhorn disk
+      ansible.builtin.set_fact:
+        prepare_nodes_mounted_source: "{{ prepare_nodes_mount_fields[1] | default('') }}"
+        prepare_nodes_mounted_fstype: "{{ prepare_nodes_mount_fields[2] | default('') }}"
+        prepare_nodes_mounted_disk: "{{ prepare_nodes_mount_fields[4] | default('') }}"
+        prepare_nodes_mounted_size: "{{ prepare_nodes_mount_fields[5] | default('0') | int }}"
+        prepare_nodes_mounted_uuid: "{{ prepare_nodes_mount_fields[6] | default('') }}"
+        prepare_nodes_existing_mount: "{{ (prepare_nodes_mount_fields[1] | default('')) | length > 0 }}"
+        prepare_nodes_suitable_disks: >-
+          {% set suitable = [] %}
+          {% for disk in prepare_nodes_unused_disks %}
+          {% if disk | length >= 3 and disk[2] | int >= prerequisites_requirements.worker.data_disk_gb | int * 1000000000 %}
+          {% set _ = suitable.append(disk) %}
+          {% endif %}
+          {% endfor %}
+          {{ suitable }}
+      when: prepare_nodes_role == 'worker'
+
+    - name: Validate an existing Longhorn mount or select one unused disk
+      ansible.builtin.assert:
+        that:
+          - >-
+            (prepare_nodes_existing_mount and prepare_nodes_mounted_disk | length > 0 and
+             prepare_nodes_mounted_disk != prepare_nodes_root_disk and
+             prepare_nodes_mounted_fstype in prerequisites_longhorn_filesystems and
+             prepare_nodes_mounted_size | int >= (prerequisites_requirements.worker.data_disk_gb | int * 1000000000) and
+             prepare_nodes_mounted_uuid | length > 0)
+            or
+            (not prepare_nodes_existing_mount and
+             ((prerequisites_data_disk_device | default('') | trim | length > 0 and
+               (prepare_nodes_unused_disks | selectattr('1', 'equalto', prerequisites_data_disk_device | trim) | list | length == 1 and
+                (prepare_nodes_unused_disks | selectattr('1', 'equalto', prerequisites_data_disk_device | trim) | map(attribute='2') | first | int >= prerequisites_requirements.worker.data_disk_gb | int * 1000000000)))
+              or
+              (prerequisites_data_disk_device | default('') | trim | length == 0 and prepare_nodes_suitable_disks | length == 1)))
+        fail_msg: >-
+          Longhorn storage is unsafe or ambiguous on {{ inventory_hostname }}.
+          Existing mount={{ prepare_nodes_existing_mount }}, root disk={{ prepare_nodes_root_disk }};
+          unused={{ prepare_nodes_unused_disks }}; rejected={{ prepare_nodes_rejected_disks }}.
+      when: prepare_nodes_role == 'worker'
+
+    - name: Set the final Longhorn device
+      ansible.builtin.set_fact:
+        prepare_nodes_selected_device: "{{ prepare_nodes_mounted_disk if prepare_nodes_existing_mount else (prerequisites_data_disk_device | trim if prerequisites_data_disk_device | default('') | trim | length > 0 else prepare_nodes_suitable_disks[0][1]) }}"
+        prepare_nodes_selected_size: "{{ prepare_nodes_mounted_size if prepare_nodes_existing_mount else (prepare_nodes_unused_disks | selectattr('1', 'equalto', (prerequisites_data_disk_device | trim if prerequisites_data_disk_device | default('') | trim | length > 0 else prepare_nodes_suitable_disks[0][1])) | map(attribute='2') | first | int) }}"
+        prepare_nodes_selected_fstype: "{{ prepare_nodes_mounted_fstype if prepare_nodes_existing_mount else 'ext4' }}"
+      when: prepare_nodes_role == 'worker'
+
+    - name: Show the selected disk and intended operation before formatting
+      ansible.builtin.debug:
+        msg: >-
+          Longhorn storage selection on {{ inventory_hostname }}:
+          device={{ prepare_nodes_selected_device }},
+          capacity={{ (prepare_nodes_selected_size | int / 1000000000) | round(2) }} GB,
+          operation={{ 'preserve existing filesystem and mount' if prepare_nodes_existing_mount else 'create ext4 filesystem and mount' }}.
+      when: prepare_nodes_role == 'worker'
+
+    - name: Record Longhorn storage authorization state
+      ansible.builtin.set_fact:
+        prepare_nodes_storage_authorized: "{{ prepare_nodes_existing_mount or prerequisites_allow_disk_format | bool }}"
+      when:
+        - prepare_nodes_role == 'worker'
+
+    - name: Report that unused-disk preparation is awaiting explicit authorization
+      ansible.builtin.debug:
+        msg: "Disk {{ prepare_nodes_selected_device }} was discovered and left untouched. Set prerequisites_allow_disk_format: true and rerun to create the ext4 filesystem and mount it."
+      when:
+        - prepare_nodes_role == 'worker'
+        - not prepare_nodes_existing_mount
+        - not prerequisites_allow_disk_format | bool
+
+    - name: Create the Longhorn filesystem only when explicitly authorized
+      ansible.builtin.command: "mkfs.ext4 {{ prepare_nodes_selected_device | quote }}"
+      when:
+        - prepare_nodes_role == 'worker'
+        - not prepare_nodes_existing_mount
+        - not ansible_check_mode
+        - prerequisites_allow_disk_format | bool
+      register: prepare_nodes_filesystem
+      changed_when: true
+
+    - name: Read the Longhorn filesystem UUID
+      ansible.builtin.command: "blkid -s UUID -o value {{ prepare_nodes_selected_device | quote }}"
+      register: prepare_nodes_selected_uuid_command
+      changed_when: false
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_authorized
+        - not ansible_check_mode
+
+    - name: Ensure the Longhorn mount point exists
+      ansible.builtin.file:
+        path: "{{ prepare_nodes_longhorn_mount }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_authorized
+        - not ansible_check_mode
+
+    - name: Mount Longhorn storage by UUID and persist it
+      ansible.posix.mount:
+        path: "{{ prepare_nodes_longhorn_mount }}"
+        src: "UUID={{ prepare_nodes_selected_uuid_command.stdout | trim }}"
+        fstype: "{{ prepare_nodes_selected_fstype }}"
+        opts: defaults
+        dump: '0'
+        passno: '2'
+        state: mounted
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_authorized
+        - not ansible_check_mode
+      register: prepare_nodes_mount
+
+    - name: Verify the Longhorn mount identity
+      ansible.builtin.shell: |
+        set -o pipefail
+        source=$(findmnt -n -o SOURCE --target {{ prepare_nodes_longhorn_mount | quote }})
+        disk=$(lsblk -s -rpnbo NAME,TYPE "$source" | awk '$2 == "disk" {d=$1} END {print d}')
+        fstype=$(findmnt -n -o FSTYPE --target {{ prepare_nodes_longhorn_mount | quote }})
+        uuid=$(blkid -s UUID -o value "$source" 2>/dev/null || true)
+        printf '%s\t%s\t%s\t%s\n' "$source" "$disk" "$fstype" "$uuid"
+      args:
+        executable: /bin/bash
+      register: prepare_nodes_mount_verification
+      changed_when: false
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_authorized
+        - not ansible_check_mode
+
+    - name: Confirm the Longhorn mount is backed by the selected disk
+      ansible.builtin.assert:
+        that:
+          - prepare_nodes_mount_verification.stdout.split('\t')[1] == prepare_nodes_selected_device
+          - prepare_nodes_mount_verification.stdout.split('\t')[2] == prepare_nodes_selected_fstype
+          - prepare_nodes_mount_verification.stdout.split('\t')[3] | length > 0
+        fail_msg: "Longhorn mount identity verification failed; expected {{ prepare_nodes_selected_device }}."
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_authorized
+        - not ansible_check_mode
+
+    - name: Gather final iSCSI and kernel preparation state
+      ansible.builtin.shell: |
+        set -o pipefail
+        printf 'overlay=%s\n' "$(grep -E '(^| )overlay( |$)' /proc/modules >/dev/null && echo loaded || echo unavailable)"
+        printf 'br_netfilter=%s\n' "$(grep -E '(^| )br_netfilter( |$)' /proc/modules >/dev/null && echo loaded || echo unavailable)"
+        printf 'iscsi_tcp=%s\n' "$(grep -E '(^| )iscsi_tcp( |$)' /proc/modules >/dev/null && echo loaded || echo not-applicable)"
+        printf 'ip_forward=%s\n' "$(sysctl -n net.ipv4.ip_forward)"
+        printf 'bridge_iptables=%s\n' "$(sysctl -n net.bridge.bridge-nf-call-iptables)"
+        printf 'swap=%s\n' "$(swapon --show=NAME --noheadings | wc -l | tr -d ' ')"
+        {% if prepare_nodes_role == 'worker' %}printf 'iscsiadm=%s\n' "$(command -v iscsiadm >/dev/null && echo ready || echo missing)"{% endif %}
+      args:
+        executable: /bin/bash
+      register: prepare_nodes_final_state
+      changed_when: false
+
+    - name: Report node preparation
+      ansible.builtin.debug:
+        msg: |
+          RKE2 NODE PREPARATION — {{ ansible_facts.hostname | default(inventory_hostname) }}
+
+          OS preparation:       COMPLETE
+          Kernel modules:       COMPLETE
+          Sysctl configuration: COMPLETE
+          Swap:                 DISABLED
+          iSCSI:                {{ 'READY' if prepare_nodes_role != 'worker' or 'iscsiadm=ready' in prepare_nodes_final_state.stdout else 'NOT READY' }}
+
+          {% if prepare_nodes_role == 'worker' %}LONGHORN
+          Device:               {{ prepare_nodes_selected_device }}
+          Filesystem:           {{ prepare_nodes_selected_fstype }}
+          Mount:                {{ prepare_nodes_longhorn_mount }}
+          Persistent:           {{ 'YES' if prepare_nodes_existing_mount or (prepare_nodes_storage_authorized and not ansible_check_mode) else ('CHECK MODE — NOT CHANGED' if ansible_check_mode else 'NO — AUTHORIZATION REQUIRED') }}
+          Storage preparation:  {{ 'COMPLETE' if prepare_nodes_existing_mount or (prepare_nodes_storage_authorized and not ansible_check_mode) else ('NOT CHANGED' if ansible_check_mode else 'AUTHORIZATION REQUIRED') }}{% else %}LONGHORN
+          Storage preparation:  NOT APPLICABLE ({{ prepare_nodes_role }}){% endif %}
+
+          Changes made: {{ (['packages'] if prepare_nodes_packages.changed else []) + (['swap disabled'] if prepare_nodes_swapoff.changed or prepare_nodes_fstab_swap.changed else []) + (['kernel module persistence'] if prepare_nodes_module_file.changed else []) + (['sysctl configuration'] if prepare_nodes_sysctl_file.changed else []) + (['NetworkManager CNI exclusions'] if prepare_nodes_network_manager_conf_result.changed | default(false) else []) + (['iSCSI service'] if prepare_nodes_iscsi_service_result.changed | default(false) else []) + (['Longhorn filesystem'] if prepare_nodes_filesystem.changed | default(false) else []) + (['Longhorn mount/fstab'] if prepare_nodes_mount.changed | default(false) else []) | join(', ') | default('none', true) }}
+          Manual actions: {{ 'Set prerequisites_allow_disk_format: true and rerun to prepare the selected unused disk.' if prepare_nodes_role == 'worker' and not prepare_nodes_existing_mount and not prerequisites_allow_disk_format | bool else 'None.' }}
+
+  handlers:
+    - name: Reload NetworkManager
+      ansible.builtin.service:
+        name: NetworkManager
+        state: reloaded
