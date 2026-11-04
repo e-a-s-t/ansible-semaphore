@@ -42,7 +42,7 @@ prerequisites_data_disk_device: ""
 
 # Formatting an automatically selected worker disk is destructive and must be
 # explicitly authorized for the preparation playbook.
-prerequisites_allow_disk_format: false
+# prerequisites_allow_disk_format: false
 
 # Shared read-only discovery command used by the validator and preparation
 # playbook. It deliberately emits tab-separated records for safe parsing.
