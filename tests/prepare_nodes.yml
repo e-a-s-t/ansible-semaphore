@@ -7,6 +7,98 @@
     required_bytes: 20000000000
 
   tasks:
+    - name: Seed a Semaphore Task 17 worker execution fixture
+      ansible.builtin.set_fact:
+        prepare_nodes_role: worker
+        prerequisites_requirements:
+          worker: { data_disk_gb: 20 }
+        prerequisites_data_disk_device: ''
+        prerequisites_allow_disk_format: false
+        prerequisites_longhorn_filesystems: [ext4, xfs]
+        prepare_nodes_mount_inspection:
+          stdout_lines:
+            - "MOUNT\t\t\t\t\t\t"
+            - "ROOT\t/dev/sda"
+        prepare_nodes_disk_discovery:
+          stdout_lines:
+            - "REJECT\t/dev/sda\t34360000000\tos-disk"
+            - "UNUSED\t/dev/sdb\t21470000000"
+
+    - name: Run the actual storage normalization and selection task sequence
+      ansible.builtin.include_tasks: ../tasks/longhorn-storage-state.yml
+
+    - name: Assert Task 17 worker selection and authorization state
+      ansible.builtin.assert:
+        that:
+          - prepare_nodes_root_disk == '/dev/sda'
+          - prepare_nodes_selected_device == '/dev/sdb'
+          - prepare_nodes_selected_size | int == 21470000000
+          - prepare_nodes_storage_status == 'AUTHORIZATION_REQUIRED'
+          - not prepare_nodes_storage_authorized | bool
+
+    - name: Execute the shared storage task sequence for all Task 17 states
+      ansible.builtin.include_tasks: ../tasks/longhorn-storage-state.yml
+      vars:
+        prepare_nodes_role: worker
+        prerequisites_requirements:
+          worker: { data_disk_gb: 20 }
+        prerequisites_data_disk_device: "{{ storage_case.override }}"
+        prerequisites_allow_disk_format: "{{ storage_case.allow }}"
+        prerequisites_longhorn_filesystems: [ext4, xfs]
+        prepare_nodes_mount_inspection: "{{ storage_case.mount }}"
+        prepare_nodes_disk_discovery: "{{ storage_case.discovery }}"
+      loop:
+        - name: no-eligible-disk
+          allow: false
+          override: ''
+          mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk", "UNUSED\t/dev/sdb\t1000000000"] }
+        - name: multiple-eligible-disks
+          allow: false
+          override: ''
+          mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk", "UNUSED\t/dev/sdb\t21470000000", "UNUSED\t/dev/sdc\t30000000000"] }
+        - name: formatting-disabled
+          allow: false
+          override: ''
+          mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk", "UNUSED\t/dev/sdb\t21470000000"] }
+        - name: formatting-enabled
+          allow: true
+          override: ''
+          mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk", "UNUSED\t/dev/sdb\t21470000000"] }
+        - name: existing-valid-mount
+          allow: false
+          override: ''
+          mount: { stdout_lines: ["MOUNT\t/dev/sdb\text4\tdefaults\t/dev/sdb\t21470000000\tuuid-sdb", "ROOT\t/dev/sda"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk"] }
+      loop_control:
+        loop_var: storage_case
+
+    - name: Assert actual task-sequence state outcomes
+      ansible.builtin.assert:
+        that:
+          - (task_sequence_results | selectattr('name', 'equalto', 'no-eligible-disk') | map(attribute='status') | first) == 'UNSAFE'
+          - (task_sequence_results | selectattr('name', 'equalto', 'multiple-eligible-disks') | map(attribute='status') | first) == 'UNSAFE'
+          - (task_sequence_results | selectattr('name', 'equalto', 'formatting-disabled') | map(attribute='status') | first) == 'AUTHORIZATION_REQUIRED'
+          - (task_sequence_results | selectattr('name', 'equalto', 'formatting-disabled') | map(attribute='device') | first) == '/dev/sdb'
+          - (task_sequence_results | selectattr('name', 'equalto', 'formatting-disabled') | map(attribute='authorized') | first | bool) == false
+          - (task_sequence_results | selectattr('name', 'equalto', 'formatting-enabled') | map(attribute='status') | first) == 'READY_TO_PREPARE'
+          - (task_sequence_results | selectattr('name', 'equalto', 'existing-valid-mount') | map(attribute='status') | first) == 'PREPARED'
+
+    - name: Exercise the final unsafe-storage failure gate
+      ansible.builtin.fail:
+        msg: unsafe storage must fail after its report is emitted
+      when: (task_sequence_results | selectattr('name', 'equalto', 'no-eligible-disk') | map(attribute='status') | first) == 'UNSAFE'
+      register: unsafe_failure_gate
+      ignore_errors: true
+
+    - name: Assert unsafe storage produces a failed Ansible result
+      ansible.builtin.assert:
+        that:
+          - unsafe_failure_gate.failed | bool
+
     - name: Model disk discovery decisions
       ansible.builtin.set_fact:
         disk_cases:
