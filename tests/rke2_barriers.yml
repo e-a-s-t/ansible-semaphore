@@ -1,0 +1,47 @@
+---
+- name: Exercise production cluster-wide barriers offline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    rke2_bootstrap_node: cp
+    rke2_require_token: true
+  tasks:
+    - name: Define fixture control plane
+      ansible.builtin.add_host:
+        name: cp
+        groups: control_plane
+        rke2_state: matching
+    - name: Define fixture worker
+      ansible.builtin.add_host:
+        name: worker
+        groups: worker
+    - name: Define alternate source
+      ansible.builtin.add_host:
+        name: alternate
+        groups: control_plane
+        rke2_state: matching
+    - name: Test blocked scenarios
+      ansible.builtin.include_tasks: rke2_barrier_case.yml
+      loop:
+        - {name: failed-bootstrap, validated: [worker], source: cp, token_ready: true, source_ready: true, bootstrap_complete: true}
+        - {name: failed-worker, validated: [cp], source: cp, token_ready: true, source_ready: true, bootstrap_complete: true}
+        - {name: excluded-source, validated: [cp, worker], source: alternate, token_ready: true, source_ready: true, bootstrap_complete: true}
+        - {name: retrieval-failed, validated: [cp, worker], source: cp, token_ready: false, source_ready: false, bootstrap_complete: true}
+        - {name: backup-failed, validated: [cp, worker], source: cp, token_ready: false, source_ready: false, bootstrap_complete: true}
+        - {name: bootstrap-failed, validated: [cp, worker], source: cp, token_ready: true, source_ready: true, bootstrap_complete: false}
+      loop_control:
+        loop_var: scenario
+    - name: Set successful alternate-source fixture excluding original bootstrap
+      ansible.builtin.set_fact:
+        rke2_target_hosts: [alternate, worker]
+        rke2_selected_source: alternate
+        rke2_token_ready: true
+        rke2_source_ready: true
+        rke2_cluster_token: fixture-token
+    - ansible.builtin.set_fact:
+        rke2_preflight_ready: true
+      delegate_to: "{{ item }}"
+      delegate_facts: true
+      loop: [alternate, worker]
+    - ansible.builtin.include_tasks: ../tasks/rke2-barrier.yml

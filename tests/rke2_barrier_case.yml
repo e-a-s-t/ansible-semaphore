@@ -1,0 +1,30 @@
+---
+- name: Initialize barrier fixture
+  ansible.builtin.set_fact:
+    rke2_target_hosts: [cp, worker]
+    rke2_selected_source: "{{ scenario.source }}"
+    rke2_token_ready: "{{ scenario.token_ready }}"
+    rke2_source_ready: "{{ scenario.source_ready }}"
+    rke2_bootstrap_complete: "{{ scenario.bootstrap_complete }}"
+    rke2_cluster_token: fixture-token
+    barrier_rejected: false
+    mutation_reached: false
+- name: Set per-host fixture readiness
+  ansible.builtin.set_fact:
+    rke2_preflight_ready: "{{ item in scenario.validated }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: [cp, worker, alternate]
+- name: Attempt production barrier followed by simulated mutation
+  block:
+    - ansible.builtin.include_tasks: ../tasks/rke2-barrier.yml
+    - ansible.builtin.set_fact:
+        mutation_reached: true
+  rescue:
+    - ansible.builtin.set_fact:
+        barrier_rejected: true
+- name: Verify failed validation blocks mutation
+  ansible.builtin.assert:
+    that:
+      - barrier_rejected
+      - not mutation_reached

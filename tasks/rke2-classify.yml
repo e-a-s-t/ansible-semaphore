@@ -1,0 +1,27 @@
+---
+- name: Inspect managed configuration without exposing input
+  ansible.builtin.set_fact:
+    rke2_inspection: >-
+      {{ rke2_state_paths | classify_rke2(rke2_version_command | default({}),
+         rke2_existing_config | default({}), rke2_marker_content | default({}),
+         rke2_expected_config, rke2_version, rke2_is_bootstrap, rke2_is_control_plane) }}
+  no_log: true
+
+- name: Assign inspected RKE2 state
+  ansible.builtin.set_fact:
+    rke2_state: "{{ rke2_inspection.state }}"
+    rke2_config_drift: "{{ rke2_inspection.drift }}"
+
+- name: Report sanitized configuration inspection
+  ansible.builtin.debug:
+    msg:
+      state: "{{ rke2_state }}"
+      error_category: "{{ rke2_inspection.error_category }}"
+      inspection_error: "{{ rke2_inspection.inspection_error }}"
+      differing_keys: "{{ rke2_inspection.differences }}"
+
+- name: Require successful configuration inspection
+  ansible.builtin.assert:
+    that:
+      - not rke2_inspection.inspection_error
+    fail_msg: "Configuration inspection failed: unreadable, malformed, or invalid input; no configuration values are logged."

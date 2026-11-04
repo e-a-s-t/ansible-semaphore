@@ -1,0 +1,12 @@
+all:
+  children:
+    control_plane:
+      hosts:
+        cp:
+          ansible_connection: local
+          rke2_state: matching
+    worker:
+      hosts:
+        worker:
+          ansible_connection: local
+          rke2_state: new

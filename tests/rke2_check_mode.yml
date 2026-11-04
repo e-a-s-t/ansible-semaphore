@@ -1,0 +1,17 @@
+---
+- name: Verify production token tasks suppress all credential operations in check mode
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - ansible.builtin.assert:
+        that: ansible_check_mode
+        fail_msg: Run this regression with --check.
+    - ansible.builtin.set_fact:
+        rke2_selected_source: localhost
+    - ansible.builtin.include_tasks: ../tasks/rke2-token.yml
+    - ansible.builtin.assert:
+        that:
+          - rke2_token_read.skipped | default(false)
+          - rke2_cluster_token is not defined
+          - rke2_token_ready is not defined

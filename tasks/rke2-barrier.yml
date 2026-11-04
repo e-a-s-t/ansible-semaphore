@@ -1,0 +1,48 @@
+---
+- name: Assert readiness of each original targeted host
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].rke2_preflight_ready | default(false) | bool
+    fail_msg: "Cluster readiness failed: a targeted node did not complete preflight. No RKE2 mutation is permitted."
+  loop: "{{ hostvars['localhost'].rke2_target_hosts | default([]) }}"
+
+- name: Assert every targeted node passed preflight
+  ansible.builtin.assert:
+    that:
+      - hostvars['localhost'].rke2_target_hosts | default([]) | length > 0
+      - hostvars['localhost'].rke2_selected_source in groups['control_plane']
+      - hostvars['localhost'].rke2_selected_source in hostvars['localhost'].rke2_target_hosts
+      - hostvars[hostvars['localhost'].rke2_selected_source].rke2_state == 'matching' or hostvars['localhost'].rke2_selected_source == rke2_bootstrap_node
+    fail_msg: "Cluster readiness failed. Every targeted node must pass preflight and the selected control-plane token source must be included in the host limit. No RKE2 mutation is permitted."
+
+- name: Require successful bootstrap phase before expansion
+  ansible.builtin.assert:
+    that:
+      - hostvars['localhost'].rke2_bootstrap_complete | default(false) | bool
+    fail_msg: "Bootstrap phase did not complete; cluster expansion is blocked."
+  when:
+    - rke2_require_bootstrap | default(false) | bool or rke2_require_token | default(false) | bool
+    - rke2_bootstrap_node in hostvars['localhost'].rke2_target_hosts
+    - not ansible_check_mode
+
+- name: Assert controller holds a validated current-run token
+  ansible.builtin.assert:
+    that:
+      - hostvars['localhost'].rke2_source_ready | default(false) | bool
+      - hostvars['localhost'].rke2_token_ready | default(false) | bool
+      - hostvars['localhost'].rke2_cluster_token | default('') | trim | length > 0
+    fail_msg: "Cluster token readiness failed; no joining node may be installed, configured, or started."
+  when:
+    - rke2_require_token | default(false) | bool
+    - not ansible_check_mode
+
+- name: Require validated existing token source before bootstrap mutation
+  ansible.builtin.assert:
+    that:
+      - hostvars['localhost'].rke2_source_ready | default(false) | bool
+      - hostvars['localhost'].rke2_token_ready | default(false) | bool
+    fail_msg: "Existing token-source validation failed; bootstrap mutation is blocked."
+  when:
+    - rke2_require_source | default(false) | bool
+    - not ansible_check_mode
+    - hostvars[hostvars['localhost'].rke2_selected_source].rke2_state == 'matching'

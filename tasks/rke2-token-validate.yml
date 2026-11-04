@@ -1,0 +1,8 @@
+---
+- name: Validate retrieved credential
+  ansible.builtin.assert:
+    that:
+      - rke2_token_read.rc | default(-1) == 0
+      - rke2_token_read.stdout | default('') | trim is match('^\\S+$')
+    fail_msg: "Selected source did not provide a valid nonempty token."
+  no_log: true

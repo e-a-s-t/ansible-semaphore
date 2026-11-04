@@ -1,0 +1,66 @@
+---
+- name: Validate and acquire existing source credentials
+  when: not ansible_check_mode
+  block:
+    - name: Invalidate token readiness before retrieval
+      ansible.builtin.set_fact:
+        rke2_source_ready: false
+        rke2_token_ready: false
+        rke2_cluster_token: ''
+      delegate_to: localhost
+      delegate_facts: true
+      become: false
+      no_log: true
+
+    - name: Inspect selected server service
+      ansible.builtin.service_facts:
+      delegate_to: "{{ hostvars['localhost'].rke2_selected_source }}"
+      register: rke2_source_services
+
+    - name: Require a running selected server
+      ansible.builtin.assert:
+        that:
+          - rke2_source_services.ansible_facts.services.get('rke2-server.service', {}).get('state', '') == 'running'
+        fail_msg: "Selected token source must have a running RKE2 server."
+
+    - name: Read existing cluster token with source SSH context
+      ansible.builtin.shell: >-
+        for token_path in {{ rke2_data_dir | quote }}/server/node-token {{ rke2_data_dir | quote }}/server/token; do
+          if [ -r "$token_path" ]; then cat "$token_path"; exit 0; fi;
+        done; exit 1
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ hostvars['localhost'].rke2_selected_source }}"
+      register: rke2_token_read
+      changed_when: false
+      no_log: true
+
+    - name: Validate token before storage
+      ansible.builtin.include_tasks: rke2-token-validate.yml
+
+    - name: Create protected controller token directory
+      ansible.builtin.file:
+        path: "{{ rke2_token_backup_path | dirname }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+
+    - name: Back up validated existing token on controller
+      ansible.builtin.copy:
+        content: "{{ rke2_token_read.stdout | trim }}\n"
+        dest: "{{ rke2_token_backup_path }}"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Publish current-run token readiness after successful backup
+      ansible.builtin.set_fact:
+        rke2_cluster_token: "{{ rke2_token_read.stdout | trim }}"
+        rke2_source_ready: true
+        rke2_token_ready: true
+      delegate_to: localhost
+      delegate_facts: true
+      become: false
+      no_log: true

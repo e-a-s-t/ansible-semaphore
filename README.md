@@ -197,3 +197,32 @@ A successful run reports a successful Ansible ping and displays:
 - Check Semaphore task logs for host-key, username, key selection, or network errors.
 
 Never commit either private key, passwords, or other credentials.
+
+### RKE2 rerun safety and offline regression checks
+
+Every targeted RKE2 host must pass classification and drift validation before
+any node can be installed, configured, or started. A failed or unreachable host
+continues to block the cluster-wide barrier even after Ansible removes it from
+active execution. Inspection errors are reported separately from drift, without
+configuration values. Matching existing nodes are preserved.
+
+Include the selected token source in Semaphore's host limit. To add workers
+while the original bootstrap is unavailable, explicitly select another existing
+control-plane node with `rke2_token_source_node` and target that source together
+with the workers; exclude the unavailable bootstrap. Token retrieval, validation,
+and the protected controller backup must succeed before joining nodes mutate.
+A binary-only partial worker installation resumes without reinstalling its binary.
+Data-bearing ambiguous states require operator review; no data is deleted.
+
+Additional offline checks (use a Python environment containing Ansible and PyYAML):
+
+```bash
+python -m unittest discover -s tests -p 'test_rke2_*.py'
+ansible-playbook tests/rke2_barriers.yml
+ansible-playbook tests/rke2_credentials.yml
+ansible-playbook tests/rke2_check_mode.yml --check
+```
+
+Negative cases deliberately exercise failed assertions and rescue them. The
+multi-host Python test expects Ansible to reject its deliberately failed hosts.
+These checks use local fixtures and do not connect to lab nodes.

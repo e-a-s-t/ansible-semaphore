@@ -1,0 +1,33 @@
+---
+- name: Simulate a host lost during preflight
+  hosts: control_plane:worker
+  connection: local
+  gather_facts: false
+  tasks:
+    - ansible.builtin.set_fact:
+        rke2_target_hosts: "{{ ansible_play_hosts_all }}"
+        rke2_selected_source: cp
+        rke2_source_ready: false
+        rke2_token_ready: false
+      delegate_to: localhost
+      delegate_facts: true
+      run_once: true
+    - name: Inject classification failure
+      ansible.builtin.fail:
+        msg: Deliberate offline classification failure
+      when: inventory_hostname == failed_host
+    - ansible.builtin.set_fact:
+        rke2_preflight_ready: true
+
+- name: Attempt mutation in a subsequent play
+  hosts: control_plane:worker
+  connection: local
+  gather_facts: false
+  vars:
+    rke2_bootstrap_node: cp
+    rke2_require_token: false
+  tasks:
+    - ansible.builtin.include_tasks: ../tasks/rke2-barrier.yml
+    - name: Mutation sentinel must never execute
+      ansible.builtin.debug:
+        msg: UNSAFE_MUTATION_EXECUTED

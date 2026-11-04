@@ -1,0 +1,12 @@
+---
+- ansible.builtin.set_fact:
+    rke2_token_read: "{{ credential.result }}"
+    rejected: false
+- block:
+    - ansible.builtin.include_tasks: ../tasks/rke2-token-validate.yml
+  rescue:
+    - ansible.builtin.set_fact:
+        rejected: true
+- ansible.builtin.assert:
+    that:
+      - rejected == credential.rejected

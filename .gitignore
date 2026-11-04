@@ -12,3 +12,6 @@
 id_rsa*
 id_ed25519*
 id_ecdsa*
+
+# Python offline regression caches
+__pycache__/
