@@ -162,7 +162,7 @@
         fi
         printf 'MOUNT\t%s\t%s\t%s\t%s\t%s\t%s\n' "$source" "$fstype" "$options" "$disk" "$size" "$uuid"
         root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
-        root_disk=$(lsblk -s -npbo NAME,TYPE "$root_source" 2>/dev/null | awk '$2 == "disk" {print $1; exit}')
+        root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | xargs -r lsblk -s -b -n -o NAME,TYPE,SIZE 2>/dev/null | awk '$2 == "disk" {print $1; exit}')
         printf 'ROOT\t%s\n' "$root_disk"
       args:
         executable: /bin/bash
@@ -173,22 +173,7 @@
     - name: Discover unused worker disks using prerequisite safety rules
       ansible.builtin.shell: |
         set +e
-        root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | xargs -r lsblk -s -npbo NAME,TYPE 2>/dev/null | awk '$2 == "disk" {print $1; exit}')
-        swap_devices=$(swapon --show=NAME --noheadings 2>/dev/null)
-        lsblk -dnbo PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS 2>/dev/null | while read -r path type size fstype mountpoint; do
-          [ "$type" = disk ] || continue
-          reason=''
-          child=$(lsblk -nrpbo NAME,TYPE,PKNAME "$path" 2>/dev/null | awk -v p="$path" '$1 != p {print; exit}')
-          signature=$(blkid -p -o export "$path" 2>/dev/null | sed -n 's/^TYPE=//p' | head -n 1)
-          if [ "$path" = "$root_disk" ]; then reason=os-disk
-          elif [ -n "$child" ]; then reason=partitions-or-mapped-children
-          elif [ "$mountpoint" != "-" ] && [ -n "$mountpoint" ]; then reason=mounted
-          elif printf '%s\n' "$swap_devices" | awk -v p="$path" '$1 == p {found=1} END {exit !found}'; then reason=swap
-          elif [ -n "$fstype" ] || [ -n "$signature" ]; then reason=existing-filesystem-or-signature
-          fi
-          if [ -n "$reason" ]; then printf 'REJECT\t%s\t%s\t%s\n' "$path" "$size" "$reason"
-          else printf 'UNUSED\t%s\t%s\n' "$path" "$size"; fi
-        done
+        {{ prerequisites_longhorn_disk_discovery_command }}
       args:
         executable: /bin/bash
       register: prepare_nodes_disk_discovery
@@ -213,43 +198,37 @@
         prepare_nodes_mounted_size: "{{ prepare_nodes_mount_fields[5] | default('0') | int }}"
         prepare_nodes_mounted_uuid: "{{ prepare_nodes_mount_fields[6] | default('') }}"
         prepare_nodes_existing_mount: "{{ (prepare_nodes_mount_fields[1] | default('')) | length > 0 }}"
-        prepare_nodes_suitable_disks: >-
+        prepare_nodes_suitable_disks_json: >-
           {% set suitable = [] %}
           {% for disk in prepare_nodes_unused_disks %}
           {% if disk | length >= 3 and disk[2] | int >= prerequisites_requirements.worker.data_disk_gb | int * 1000000000 %}
           {% set _ = suitable.append(disk) %}
           {% endif %}
           {% endfor %}
-          {{ suitable }}
+          {{ suitable | to_json }}
       when: prepare_nodes_role == 'worker'
 
-    - name: Validate an existing Longhorn mount or select one unused disk
-      ansible.builtin.assert:
-        that:
-          - >-
-            (prepare_nodes_existing_mount and prepare_nodes_mounted_disk | length > 0 and
-             prepare_nodes_mounted_disk != prepare_nodes_root_disk and
-             prepare_nodes_mounted_fstype in prerequisites_longhorn_filesystems and
-             prepare_nodes_mounted_size | int >= (prerequisites_requirements.worker.data_disk_gb | int * 1000000000) and
-             prepare_nodes_mounted_uuid | length > 0)
-            or
-            (not prepare_nodes_existing_mount and
-             ((prerequisites_data_disk_device | default('') | trim | length > 0 and
-               (prepare_nodes_unused_disks | selectattr('1', 'equalto', prerequisites_data_disk_device | trim) | list | length == 1 and
-                (prepare_nodes_unused_disks | selectattr('1', 'equalto', prerequisites_data_disk_device | trim) | map(attribute='2') | first | int >= prerequisites_requirements.worker.data_disk_gb | int * 1000000000)))
-              or
-              (prerequisites_data_disk_device | default('') | trim | length == 0 and prepare_nodes_suitable_disks | length == 1)))
-        fail_msg: >-
-          Longhorn storage is unsafe or ambiguous on {{ inventory_hostname }}.
-          Existing mount={{ prepare_nodes_existing_mount }}, root disk={{ prepare_nodes_root_disk }};
-          unused={{ prepare_nodes_unused_disks }}; rejected={{ prepare_nodes_rejected_disks }}.
+    - name: Parse suitable Longhorn disks
+      ansible.builtin.set_fact:
+        prepare_nodes_suitable_disks: "{{ prepare_nodes_suitable_disks_json | from_json }}"
+      when: prepare_nodes_role == 'worker'
+
+    - name: Classify Longhorn storage state without mutating unsafe disks
+      ansible.builtin.set_fact:
+        prepare_nodes_storage_status: >-
+          {% set minimum = prerequisites_requirements.worker.data_disk_gb | int * 1000000000 %}
+          {% set override = prerequisites_data_disk_device | default('') | trim %}
+          {% set override_matches = prepare_nodes_unused_disks | selectattr('1', 'equalto', override) | list %}
+          {% set mounted_valid = prepare_nodes_existing_mount and prepare_nodes_mounted_disk | length > 0 and prepare_nodes_mounted_disk != prepare_nodes_root_disk and prepare_nodes_mounted_fstype in prerequisites_longhorn_filesystems and prepare_nodes_mounted_size | int >= minimum and prepare_nodes_mounted_uuid | length > 0 %}
+          {% set unused_valid = (override | length > 0 and override_matches | length == 1 and override_matches[0][2] | int >= minimum) or (override | length == 0 and prepare_nodes_suitable_disks | length == 1) %}
+          {{ 'READY_EXISTING' if mounted_valid else ('READY_UNUSED' if not prepare_nodes_existing_mount and unused_valid else 'FAILED') }}
       when: prepare_nodes_role == 'worker'
 
     - name: Set the final Longhorn device
       ansible.builtin.set_fact:
-        prepare_nodes_selected_device: "{{ prepare_nodes_mounted_disk if prepare_nodes_existing_mount else (prerequisites_data_disk_device | trim if prerequisites_data_disk_device | default('') | trim | length > 0 else prepare_nodes_suitable_disks[0][1]) }}"
-        prepare_nodes_selected_size: "{{ prepare_nodes_mounted_size if prepare_nodes_existing_mount else (prepare_nodes_unused_disks | selectattr('1', 'equalto', (prerequisites_data_disk_device | trim if prerequisites_data_disk_device | default('') | trim | length > 0 else prepare_nodes_suitable_disks[0][1])) | map(attribute='2') | first | int) }}"
-        prepare_nodes_selected_fstype: "{{ prepare_nodes_mounted_fstype if prepare_nodes_existing_mount else 'ext4' }}"
+        prepare_nodes_selected_device: "{{ prepare_nodes_mounted_disk if prepare_nodes_storage_status == 'READY_EXISTING' else ((prerequisites_data_disk_device | trim) if prepare_nodes_storage_status == 'READY_UNUSED' and prerequisites_data_disk_device | default('') | trim | length > 0 else (prepare_nodes_suitable_disks[0][1] if prepare_nodes_storage_status == 'READY_UNUSED' and prepare_nodes_suitable_disks | length == 1 else '')) }}"
+        prepare_nodes_selected_size: "{{ prepare_nodes_mounted_size if prepare_nodes_storage_status == 'READY_EXISTING' else ((prepare_nodes_unused_disks | selectattr('1', 'equalto', prerequisites_data_disk_device | trim) | map(attribute='2') | first | int) if prepare_nodes_storage_status == 'READY_UNUSED' and prerequisites_data_disk_device | default('') | trim | length > 0 else (prepare_nodes_suitable_disks[0][2] | int if prepare_nodes_storage_status == 'READY_UNUSED' and prepare_nodes_suitable_disks | length == 1 else 0)) }}"
+        prepare_nodes_selected_fstype: "{{ prepare_nodes_mounted_fstype if prepare_nodes_storage_status == 'READY_EXISTING' else 'ext4' }}"
       when: prepare_nodes_role == 'worker'
 
     - name: Show the selected disk and intended operation before formatting
@@ -259,11 +238,25 @@
           device={{ prepare_nodes_selected_device }},
           capacity={{ (prepare_nodes_selected_size | int / 1000000000) | round(2) }} GB,
           operation={{ 'preserve existing filesystem and mount' if prepare_nodes_existing_mount else 'create ext4 filesystem and mount' }}.
-      when: prepare_nodes_role == 'worker'
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status != 'FAILED'
+
+    - name: Report unsafe or ambiguous Longhorn storage before failing
+      ansible.builtin.debug:
+        msg: >-
+          Longhorn storage preparation failed safely on {{ inventory_hostname }}:
+          root={{ prepare_nodes_root_disk }};
+          unused={{ prepare_nodes_unused_disks }};
+          rejected={{ prepare_nodes_rejected_disks }};
+          existing_mount={{ prepare_nodes_existing_mount }}.
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status == 'FAILED'
 
     - name: Record Longhorn storage authorization state
       ansible.builtin.set_fact:
-        prepare_nodes_storage_authorized: "{{ prepare_nodes_existing_mount or prerequisites_allow_disk_format | bool }}"
+        prepare_nodes_storage_authorized: "{{ prepare_nodes_storage_status == 'READY_EXISTING' or (prepare_nodes_storage_status == 'READY_UNUSED' and prerequisites_allow_disk_format | bool) }}"
       when:
         - prepare_nodes_role == 'worker'
 
@@ -272,14 +265,14 @@
         msg: "Disk {{ prepare_nodes_selected_device }} was discovered and left untouched. Set prerequisites_allow_disk_format: true and rerun to create the ext4 filesystem and mount it."
       when:
         - prepare_nodes_role == 'worker'
-        - not prepare_nodes_existing_mount
+        - prepare_nodes_storage_status == 'READY_UNUSED'
         - not prerequisites_allow_disk_format | bool
 
     - name: Create the Longhorn filesystem only when explicitly authorized
       ansible.builtin.command: "mkfs.ext4 {{ prepare_nodes_selected_device | quote }}"
       when:
         - prepare_nodes_role == 'worker'
-        - not prepare_nodes_existing_mount
+        - prepare_nodes_storage_status == 'READY_UNUSED'
         - not ansible_check_mode
         - prerequisites_allow_disk_format | bool
       register: prepare_nodes_filesystem
@@ -291,6 +284,7 @@
       changed_when: false
       when:
         - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status in ['READY_EXISTING', 'READY_UNUSED']
         - prepare_nodes_storage_authorized
         - not ansible_check_mode
 
@@ -303,6 +297,7 @@
         mode: '0755'
       when:
         - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status in ['READY_EXISTING', 'READY_UNUSED']
         - prepare_nodes_storage_authorized
         - not ansible_check_mode
 
@@ -317,6 +312,7 @@
         state: mounted
       when:
         - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status in ['READY_EXISTING', 'READY_UNUSED']
         - prepare_nodes_storage_authorized
         - not ansible_check_mode
       register: prepare_nodes_mount
@@ -335,6 +331,7 @@
       changed_when: false
       when:
         - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status in ['READY_EXISTING', 'READY_UNUSED']
         - prepare_nodes_storage_authorized
         - not ansible_check_mode
 
@@ -347,8 +344,21 @@
         fail_msg: "Longhorn mount identity verification failed; expected {{ prepare_nodes_selected_device }}."
       when:
         - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status in ['READY_EXISTING', 'READY_UNUSED']
         - prepare_nodes_storage_authorized
         - not ansible_check_mode
+
+    - name: Build report change list
+      ansible.builtin.set_fact:
+        prepare_nodes_report_changes: >-
+          {{ (['packages'] if prepare_nodes_packages.changed | default(false) else [])
+             + (['swap disabled'] if (prepare_nodes_swapoff.changed | default(false)) or (prepare_nodes_fstab_swap.changed | default(false)) else [])
+             + (['kernel module persistence'] if prepare_nodes_module_file.changed | default(false) else [])
+             + (['sysctl configuration'] if prepare_nodes_sysctl_file.changed | default(false) else [])
+             + (['NetworkManager CNI exclusions'] if prepare_nodes_network_manager_conf_result.changed | default(false) else [])
+             + (['iSCSI service'] if prepare_nodes_iscsi_service_result is defined and prepare_nodes_iscsi_service_result.changed | default(false) else [])
+             + (['Longhorn filesystem'] if prepare_nodes_filesystem.changed | default(false) else [])
+             + (['Longhorn mount/fstab'] if prepare_nodes_mount.changed | default(false) else []) }}
 
     - name: Gather final iSCSI and kernel preparation state
       ansible.builtin.shell: |
@@ -377,15 +387,22 @@
           iSCSI:                {{ 'READY' if prepare_nodes_role != 'worker' or 'iscsiadm=ready' in prepare_nodes_final_state.stdout else 'NOT READY' }}
 
           {% if prepare_nodes_role == 'worker' %}LONGHORN
-          Device:               {{ prepare_nodes_selected_device }}
-          Filesystem:           {{ prepare_nodes_selected_fstype }}
+          Device:               {{ prepare_nodes_selected_device | default('not selected') }}
+          Filesystem:           {{ prepare_nodes_selected_fstype | default('unknown') }}
           Mount:                {{ prepare_nodes_longhorn_mount }}
-          Persistent:           {{ 'YES' if prepare_nodes_existing_mount or (prepare_nodes_storage_authorized and not ansible_check_mode) else ('CHECK MODE — NOT CHANGED' if ansible_check_mode else 'NO — AUTHORIZATION REQUIRED') }}
-          Storage preparation:  {{ 'COMPLETE' if prepare_nodes_existing_mount or (prepare_nodes_storage_authorized and not ansible_check_mode) else ('NOT CHANGED' if ansible_check_mode else 'AUTHORIZATION REQUIRED') }}{% else %}LONGHORN
+          Persistent:           {{ 'YES' if prepare_nodes_storage_status == 'READY_EXISTING' or (prepare_nodes_storage_status == 'READY_UNUSED' and prepare_nodes_storage_authorized and not ansible_check_mode) else ('CHECK MODE — NOT CHANGED' if ansible_check_mode and prepare_nodes_storage_status != 'FAILED' else ('NO — AUTHORIZATION REQUIRED' if prepare_nodes_storage_status == 'READY_UNUSED' else 'NO')) }}
+          Storage preparation:  {{ 'COMPLETE' if prepare_nodes_storage_status == 'READY_EXISTING' or (prepare_nodes_storage_status == 'READY_UNUSED' and prepare_nodes_storage_authorized and not ansible_check_mode) else ('NOT CHANGED' if ansible_check_mode and prepare_nodes_storage_status != 'FAILED' else ('AUTHORIZATION REQUIRED' if prepare_nodes_storage_status == 'READY_UNUSED' else 'FAILED')) }}{% else %}LONGHORN
           Storage preparation:  NOT APPLICABLE ({{ prepare_nodes_role }}){% endif %}
 
-          Changes made: {{ (['packages'] if prepare_nodes_packages.changed else []) + (['swap disabled'] if prepare_nodes_swapoff.changed or prepare_nodes_fstab_swap.changed else []) + (['kernel module persistence'] if prepare_nodes_module_file.changed else []) + (['sysctl configuration'] if prepare_nodes_sysctl_file.changed else []) + (['NetworkManager CNI exclusions'] if prepare_nodes_network_manager_conf_result.changed | default(false) else []) + (['iSCSI service'] if prepare_nodes_iscsi_service_result.changed | default(false) else []) + (['Longhorn filesystem'] if prepare_nodes_filesystem.changed | default(false) else []) + (['Longhorn mount/fstab'] if prepare_nodes_mount.changed | default(false) else []) | join(', ') | default('none', true) }}
-          Manual actions: {{ 'Set prerequisites_allow_disk_format: true and rerun to prepare the selected unused disk.' if prepare_nodes_role == 'worker' and not prepare_nodes_existing_mount and not prerequisites_allow_disk_format | bool else 'None.' }}
+          Changes made: {{ (prepare_nodes_report_changes | default([]) | join(', ')) or 'none' }}
+          Manual actions: {{ 'Set prerequisites_allow_disk_format: true and rerun to prepare the selected unused disk.' if prepare_nodes_role == 'worker' and prepare_nodes_storage_status == 'READY_UNUSED' and not prerequisites_allow_disk_format | bool else 'None.' }}
+
+    - name: Fail after reporting unsafe or ambiguous storage
+      ansible.builtin.fail:
+        msg: "Longhorn storage preparation failed safely on {{ inventory_hostname }}; review the report above."
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status == 'FAILED'
 
   handlers:
     - name: Reload NetworkManager

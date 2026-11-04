@@ -44,6 +44,26 @@ prerequisites_data_disk_device: ""
 # explicitly authorized for the preparation playbook.
 prerequisites_allow_disk_format: false
 
+# Shared read-only discovery command used by the validator and preparation
+# playbook. It deliberately emits tab-separated records for safe parsing.
+prerequisites_longhorn_disk_discovery_command: >-
+  root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | xargs -r lsblk -s -b -n -o NAME,TYPE,SIZE 2>/dev/null | awk '$2 == "disk" {print $1; exit}');
+  swap_devices=$(swapon --show=NAME --noheadings 2>/dev/null);
+  lsblk -dnbo PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS 2>/dev/null | while read -r path type size fstype mountpoint; do
+  [ "$type" = disk ] || continue;
+  reason=;
+  child=$(lsblk -nrpbo NAME,TYPE,PKNAME "$path" 2>/dev/null | awk -v p="$path" '$1 != p {print; exit}');
+  signature=$(blkid -p -o value -s TYPE "$path" 2>/dev/null || true);
+  if [ "$path" = "$root_disk" ]; then reason=os-disk;
+  elif [ -n "$child" ]; then reason=partitions-or-mapped-children;
+  elif [ "$mountpoint" != "-" ] && [ -n "$mountpoint" ]; then reason=mounted;
+  elif printf '%s\n' "$swap_devices" | awk -v p="$path" '$1 == p {found=1} END {exit !found}'; then reason=swap;
+  elif [ -n "$fstype" ] || [ -n "$signature" ]; then reason=existing-filesystem;
+  fi;
+  if [ -n "$reason" ]; then printf 'REJECT\t%s\t%s\t%s\n' "$path" "$size" "$reason";
+  else printf 'UNUSED\t%s\t%s\n' "$path" "$size"; fi;
+  done
+
 # Only explicitly configured endpoints are tested. Each item may contain:
 # name, host, port, and tls (true/false).
 prerequisites_network_endpoints: []

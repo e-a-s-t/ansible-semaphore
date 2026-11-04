@@ -77,3 +77,62 @@
           - second_run.filesystem_created | bool == false
           - second_run.mount_changed | bool == false
           - second_run.persistent | bool
+
+    - name: Reproduce Task 16 root-disk and discovery evidence
+      ansible.builtin.set_fact:
+        task16_root_record: "ROOT\t/dev/sda"
+        task16_discovery_records:
+          - "REJECT\t/dev/sda\t34360000000\tos-disk"
+          - "UNUSED\t/dev/sdb\t21470000000"
+        task16_profile_requirements:
+          production: 500000000000
+          lab: 20000000000
+
+    - name: Classify Task 16 discovery using active profile thresholds
+      ansible.builtin.set_fact:
+        task16_root_disk: "{{ task16_root_record.split('\t')[1] }}"
+        task16_lab_candidates: >-
+          {% set candidates = [] %}
+          {% for record in task16_discovery_records %}
+          {% set fields = record.split('\t') %}
+          {% if fields[0] == 'UNUSED' and fields[2] | int >= task16_profile_requirements.lab %}
+          {% set _ = candidates.append(fields) %}
+          {% endif %}
+          {% endfor %}
+          {{ candidates }}
+
+    - name: Assert Task 16 discovery and profile isolation
+      ansible.builtin.assert:
+        that:
+          - task16_root_disk == '/dev/sda'
+          - task16_lab_candidates | from_yaml | length == 1
+          - (task16_lab_candidates | from_yaml)[0][1] == '/dev/sdb'
+          - task16_profile_requirements.lab == 20000000000
+          - task16_profile_requirements.production == 500000000000
+
+    - name: Render role-specific report change lists
+      ansible.builtin.set_fact:
+        control_plane_report_changes: "{{ (['packages'] if true else []) + (['iSCSI service'] if false else []) + (['Longhorn filesystem'] if false else []) }}"
+        worker_report_changes: "{{ (['packages'] if true else []) + (['iSCSI service'] if true else []) + (['Longhorn mount/fstab'] if true else []) }}"
+
+    - name: Assert report list concatenation and join behavior
+      ansible.builtin.assert:
+        that:
+          - control_plane_report_changes | join(', ') == 'packages'
+          - worker_report_changes | join(', ') == 'packages, iSCSI service, Longhorn mount/fstab'
+
+    - name: Model report storage states for all execution paths
+      ansible.builtin.set_fact:
+        report_storage_states:
+          control_plane: NOT_APPLICABLE
+          awaiting_authorization: AUTHORIZATION_REQUIRED
+          existing_mount: COMPLETE
+          prepared_current_run: COMPLETE
+
+    - name: Assert report states distinguish OS success and storage state
+      ansible.builtin.assert:
+        that:
+          - report_storage_states.control_plane == 'NOT_APPLICABLE'
+          - report_storage_states.awaiting_authorization == 'AUTHORIZATION_REQUIRED'
+          - report_storage_states.existing_mount == 'COMPLETE'
+          - report_storage_states.prepared_current_run == 'COMPLETE'
