@@ -175,3 +175,58 @@
           - cluster_data_state == 'unknown'
           - retry_mutations | length == 3
           - forbidden_recovery_actions | intersect(['delete-data', 'uninstall', 'rotate-token']) | length == 3
+
+    - name: Model existing bootstrap token retrieval connection context
+      ansible.builtin.set_fact:
+        token_source_host: cp-b
+        token_source_play_hosts: control_plane
+        token_source_become: true
+        controller_transfer_delegate: localhost
+        controller_transfer_become: false
+        controller_transfer_delegate_facts: true
+        controller_token_backup_mode: '0600'
+
+    - name: Assert token retrieval uses target SSH context and protected controller transfer
+      ansible.builtin.assert:
+        that:
+          - token_source_host == rke2_bootstrap_node
+          - token_source_play_hosts == 'control_plane'
+          - token_source_become | bool
+          - controller_transfer_delegate == 'localhost'
+          - not controller_transfer_become | bool
+          - controller_transfer_delegate_facts | bool
+          - controller_token_backup_mode == '0600'
+
+    - name: Model interrupted bootstrap recovery after configuration was written
+      ansible.builtin.set_fact:
+        interrupted_bootstrap:
+          binary: true
+          config: true
+          data_dir: true
+          marker: false
+          token: true
+        interrupted_bootstrap_state: matching
+        recovery_actions: [read-token, backup-token, preserve-config]
+
+    - name: Assert interrupted bootstrap resumes without reinstall or token rotation
+      ansible.builtin.assert:
+        that:
+          - interrupted_bootstrap.binary | bool
+          - interrupted_bootstrap.config | bool
+          - interrupted_bootstrap.token | bool
+          - not interrupted_bootstrap.marker | bool
+          - interrupted_bootstrap_state == 'matching'
+          - "'read-token' in recovery_actions"
+          - "'backup-token' in recovery_actions"
+          - "'preserve-config' in recovery_actions"
+          - "'delete-data' not in recovery_actions"
+          - "'rotate-token' not in recovery_actions"
+
+    - name: Model check-mode token suppression
+      ansible.builtin.set_fact:
+        check_mode_token_operations: [classify, inspect-config, inspect-service, report]
+
+    - name: Assert check mode does not retrieve or transfer tokens
+      ansible.builtin.assert:
+        that:
+          - check_mode_token_operations | intersect(['read-token', 'backup-token', 'join-with-token']) | length == 0

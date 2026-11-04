@@ -108,7 +108,7 @@
           {{ 'new' if not rke2_has_binary and not rke2_has_cluster_state else
              ('incomplete_install' if rke2_has_binary and not rke2_has_cluster_state else
               ('drifted' if rke2_config_drift else
-               ('matching' if rke2_state_paths.results[3].stat.exists else 'unknown'))) }}
+               ('matching' if rke2_state_paths.results[1].stat.exists else 'unknown'))) }}
       no_log: true
 
     - name: Derive fixed RKE2 Linux AMD64 artifact URLs
@@ -306,11 +306,11 @@
         - not ansible_check_mode
       no_log: true
 
-- name: Acquire and protect the cluster token on the controller
-  hosts: localhost
-  connection: local
+- name: Acquire the cluster token from the selected control-plane source
+  hosts: control_plane
+  serial: 1
   gather_facts: false
-  become: false
+  become: true
   vars_files:
     - ../vars/rke2.yml
   vars:
@@ -320,44 +320,61 @@
       ansible.builtin.assert:
         that:
           - rke2_selected_token_source in groups['control_plane']
-          - hostvars[rke2_selected_token_source].rke2_state in ['new', 'matching']
+          - hostvars[rke2_selected_token_source].rke2_state in ['new', 'incomplete_install', 'matching']
         fail_msg: "rke2_token_source_node must name a control-plane host."
-      when: not ansible_check_mode
+      when:
+        - inventory_hostname == rke2_selected_token_source
+        - not ansible_check_mode
 
     - name: Read the existing or newly generated server token
       ansible.builtin.shell: >-
         for token_path in {{ rke2_data_dir | quote }}/server/node-token {{ rke2_data_dir | quote }}/server/token; do
           if [ -r "$token_path" ]; then cat "$token_path"; exit 0; fi;
         done;
+        echo "No existing RKE2 server token found in {{ rke2_data_dir }}/server" >&2;
         exit 1
       args:
         executable: /bin/bash
-      delegate_to: "{{ rke2_selected_token_source }}"
       register: rke2_token_read
       changed_when: false
       no_log: true
-      when: not ansible_check_mode
+      when:
+        - inventory_hostname == rke2_selected_token_source
+        - not ansible_check_mode
 
-    - name: Preserve token in controller memory
+    - name: Transfer token to controller memory without exposing it
       ansible.builtin.set_fact:
         rke2_cluster_token: "{{ rke2_token_read.stdout | trim }}"
+      delegate_to: localhost
+      delegate_facts: true
+      become: false
       no_log: true
-      when: not ansible_check_mode
+      when:
+        - inventory_hostname == rke2_selected_token_source
+        - not ansible_check_mode
 
-    - name: Create protected token backup directory
+    - name: Create protected controller token backup directory
       ansible.builtin.file:
         path: "{{ rke2_token_backup_path | dirname }}"
         state: directory
         mode: '0700'
-      when: not ansible_check_mode
+      delegate_to: localhost
+      become: false
+      when:
+        - inventory_hostname == rke2_selected_token_source
+        - not ansible_check_mode
 
-    - name: Back up the cluster token outside the cluster
+    - name: Back up the existing cluster token outside the cluster
       ansible.builtin.copy:
-        content: "{{ rke2_cluster_token }}\n"
+        content: "{{ hostvars['localhost']['rke2_cluster_token'] }}\n"
         dest: "{{ rke2_token_backup_path }}"
         mode: '0600'
+      delegate_to: localhost
+      become: false
       no_log: true
-      when: not ansible_check_mode
+      when:
+        - inventory_hostname == rke2_selected_token_source
+        - not ansible_check_mode
 
 - name: Join additional control-plane nodes
   hosts: control_plane
@@ -511,9 +528,6 @@
         - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
         - rke2_worker_install_result.rc != 0
-      when:
-        - rke2_state in ['new', 'incomplete_install']
-        - not ansible_check_mode
 
     - name: Configure a new worker agent
       ansible.builtin.copy:
