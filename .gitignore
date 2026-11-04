@@ -1,0 +1,14 @@
+# Ansible runtime files
+*.retry
+.ansible/
+
+# Local environment and secret files
+.env
+.env.*
+*.vault-password*
+
+# SSH private keys and common key material
+*.pem
+id_rsa*
+id_ed25519*
+id_ecdsa*

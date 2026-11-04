@@ -1,0 +1,22 @@
+---
+- name: Verify connectivity to Proxmox2 targets
+  hosts: proxmox2_targets
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Verify Ansible connectivity
+      ansible.builtin.ping:
+
+    - name: Gather basic system information
+      ansible.builtin.setup:
+
+    - name: Display basic system information
+      ansible.builtin.debug:
+        msg:
+          - "Hostname: {{ ansible_facts['hostname'] }}"
+          - "Operating system: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+          - "Kernel: {{ ansible_facts['kernel'] }}"
+          - "CPU architecture: {{ ansible_facts['architecture'] }}"
+          - "Available memory: {{ ansible_facts['memtotal_mb'] }} MB"
+          - "CPU cores: {{ ansible_facts['processor_vcpus'] | default(ansible_facts['processor_count']) }}"
