@@ -411,6 +411,35 @@
           - longhorn_excluded_devices | map(attribute='reason') | list | difference(['os-disk', 'mounted', 'swap', 'lvm', 'raid', 'existing-filesystem', 'partitions-or-mapped-children']) | length == 0
           - longhorn_excluded_devices | length == 7
 
+    - name: Classify actual Basel worker disk topology at production and lab thresholds
+      ansible.builtin.set_fact:
+        basel_longhorn_cases: "{{ basel_longhorn_cases | default([]) + [case_result] }}"
+      vars:
+        basel_unused_disk_bytes: 21470000000
+        qualifying: "{{ basel_unused_disk_bytes >= item.required_gb * 1000000000 }}"
+        case_result:
+          name: "{{ item.name }}"
+          status: "{{ 'PASS' if qualifying else 'FAIL' }}"
+          suitable: "{{ ['/dev/sdb'] if qualifying else [] }}"
+          undersized: "{{ [] if qualifying else ['/dev/sdb'] }}"
+          rejected: ['/dev/sda']
+          report: "REJECTED /dev/sda 34.36 GB os-disk; UNDERSIZED /dev/sdb 21.47 GB"
+      loop:
+        - { name: production-500gb, required_gb: 500 }
+        - { name: lab-20gb, required_gb: 20 }
+
+    - name: Assert Basel topology classification and capacity override behavior
+      ansible.builtin.assert:
+        that:
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'production-500gb') | map(attribute='status') | first) == 'FAIL'
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'production-500gb') | map(attribute='suitable') | first | length) == 0
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'production-500gb') | map(attribute='undersized') | first) == ['/dev/sdb']
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'production-500gb') | map(attribute='rejected') | first) == ['/dev/sda']
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'lab-20gb') | map(attribute='status') | first) == 'PASS'
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'lab-20gb') | map(attribute='suitable') | first) == ['/dev/sdb']
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'production-500gb') | map(attribute='report') | first) is search('/dev/sda.*34.36 GB')
+          - (basel_longhorn_cases | selectattr('name', 'equalto', 'production-500gb') | map(attribute='report') | first) is search('/dev/sdb.*21.47 GB')
+
     - name: Model memory remediation messages
       ansible.builtin.set_fact:
         memory_remediation_cases:
