@@ -31,6 +31,40 @@ prerequisites_data_disk_device: ""
 # name, host, port, and tls (true/false).
 prerequisites_network_endpoints: []
 
+# The Cilium mode is intentionally unset until the installation configuration
+# is chosen. Unset mode-specific checks are reported as SKIP.
+prerequisites_cilium_routing_mode: ""
+prerequisites_cilium_pod_cidr: ""
+prerequisites_cilium_service_cidr: ""
+prerequisites_cilium_min_kernel: "5.10"
+
+# Longhorn V1 is the default deployment assumed by this validation. V2-only
+# kernel and huge-page requirements are not reported unless explicitly chosen.
+prerequisites_longhorn_engine: v1
+prerequisites_longhorn_data_path: /var/lib/longhorn
+prerequisites_longhorn_filesystems:
+  - ext4
+  - xfs
+prerequisites_longhorn_required_utilities:
+  - fstrim
+  - blkid
+
+# Only these infrastructure checks can make a fresh VM incomplete. Carekube-
+# managed installation settings and runtime-only checks never do so.
+prerequisites_mandatory_infrastructure_checks:
+  - Node role assignment
+  - Operating system
+  - Architecture
+  - CPU
+  - Memory
+  - OS disk
+  - Dedicated role data disk
+  - IPv4 address
+  - Default route
+  - Hostname resolution
+  - DNS resolvers
+  - Time synchronization
+
 # These settings are useful context but are normally configurable by RKE2.
 prerequisites_installation_deferred_settings:
   - br_netfilter module loaded

@@ -231,3 +231,40 @@
           - "bounded_actual.endswith('...')"
           - report_generated
           - mandatory_failure
+
+    - name: Model three-state readiness classification
+      ansible.builtin.set_fact:
+        fresh_vm_results:
+          - { status: PASS, mandatory: true, applicable: true, owner: Infrastructure, incomplete: false }
+          - { status: WARN, mandatory: false, applicable: true, owner: Carekube, incomplete: false }
+        uncertain_vm_results:
+          - { status: WARN, mandatory: true, applicable: true, owner: Infrastructure, incomplete: true }
+        blocked_vm_results:
+          - { status: FAIL, mandatory: true, applicable: true, owner: Infrastructure, incomplete: false }
+
+    - name: Derive three-state readiness values
+      ansible.builtin.set_fact:
+        fresh_vm_readiness: "{{ 'NOT READY' if fresh_vm_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0 else ('INCOMPLETE' if fresh_vm_results | selectattr('incomplete', 'equalto', true) | list | length > 0 else 'READY') }}"
+        uncertain_vm_readiness: "{{ 'NOT READY' if uncertain_vm_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0 else ('INCOMPLETE' if uncertain_vm_results | selectattr('incomplete', 'equalto', true) | list | length > 0 else 'READY') }}"
+        blocked_vm_readiness: "{{ 'NOT READY' if blocked_vm_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0 else ('INCOMPLETE' if blocked_vm_results | selectattr('incomplete', 'equalto', true) | list | length > 0 else 'READY') }}"
+
+    - name: Assert fresh VM, incomplete evidence, and confirmed blocker states
+      ansible.builtin.assert:
+        that:
+          - fresh_vm_readiness == 'READY'
+          - uncertain_vm_readiness == 'INCOMPLETE'
+          - blocked_vm_readiness == 'NOT READY'
+          - fresh_vm_results | selectattr('owner', 'equalto', 'Carekube') | selectattr('incomplete', 'equalto', true) | list | length == 0
+
+    - name: Assert prioritized report ordering
+      ansible.builtin.assert:
+        that:
+          - report_text.find('OVERALL READINESS') == -1 or report_text.find('SUMMARY') > report_text.find('OVERALL READINESS')
+          - report_text.find('ACTION REQUIRED') == -1 or report_text.find('DETAILED VALIDATION RESULTS') == -1 or report_text.find('ACTION REQUIRED') < report_text.find('DETAILED VALIDATION RESULTS')
+
+    - name: Assert the production report category set
+      ansible.builtin.assert:
+        that:
+          - "'SYSTEM STORAGE NETWORK RKE2 CILIUM LONGHORN'.split() | length == 6"
+          - "'SYSTEM STORAGE NETWORK RKE2 CILIUM LONGHORN'.split() | difference(['SYSTEM', 'STORAGE', 'NETWORK', 'RKE2', 'CILIUM', 'LONGHORN']) | length == 0"
+          - "'KUBERNETES' not in 'SYSTEM STORAGE NETWORK RKE2 CILIUM LONGHORN'.split()"
