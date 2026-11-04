@@ -116,6 +116,7 @@
         fail_msg: >-
           {{ inventory_hostname }} has {{ rke2_state }} RKE2 state. Existing nodes are not
           modified automatically; review configuration and cluster identity before retrying.
+      when: not ansible_check_mode
 
 - name: Bootstrap or preserve the explicit bootstrap node
   hosts: control_plane
@@ -134,6 +135,7 @@
       when:
         - inventory_hostname == rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
 
     - name: Install RKE2 server on a new bootstrap
       ansible.builtin.shell: >-
@@ -148,6 +150,7 @@
       when:
         - inventory_hostname == rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
       no_log: true
 
     - name: Configure a new embedded-etcd bootstrap server
@@ -168,6 +171,7 @@
       when:
         - inventory_hostname == rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
       no_log: true
       register: rke2_bootstrap_config
 
@@ -179,6 +183,7 @@
       when:
         - inventory_hostname == rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
 
     - name: Wait for the bootstrap token
       ansible.builtin.shell: >-
@@ -189,6 +194,7 @@
       when:
         - inventory_hostname == rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
       register: rke2_token_wait
       retries: 60
       delay: 5
@@ -206,6 +212,7 @@
       when:
         - inventory_hostname == rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
       no_log: true
 
 - name: Acquire and protect the cluster token on the controller
@@ -224,6 +231,7 @@
           - rke2_selected_token_source in groups['control_plane']
           - hostvars[rke2_selected_token_source].rke2_state in ['new', 'matching']
         fail_msg: "rke2_token_source_node must name a control-plane host."
+      when: not ansible_check_mode
 
     - name: Read the existing or newly generated server token
       ansible.builtin.shell: >-
@@ -237,17 +245,20 @@
       register: rke2_token_read
       changed_when: false
       no_log: true
+      when: not ansible_check_mode
 
     - name: Preserve token in controller memory
       ansible.builtin.set_fact:
         rke2_cluster_token: "{{ rke2_token_read.stdout | trim }}"
       no_log: true
+      when: not ansible_check_mode
 
     - name: Create protected token backup directory
       ansible.builtin.file:
         path: "{{ rke2_token_backup_path | dirname }}"
         state: directory
         mode: '0700'
+      when: not ansible_check_mode
 
     - name: Back up the cluster token outside the cluster
       ansible.builtin.copy:
@@ -255,6 +266,7 @@
         dest: "{{ rke2_token_backup_path }}"
         mode: '0600'
       no_log: true
+      when: not ansible_check_mode
 
 - name: Join additional control-plane nodes
   hosts: control_plane
@@ -277,6 +289,7 @@
       when:
         - inventory_hostname != rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
       no_log: true
 
     - name: Configure a new joining control-plane node
@@ -297,6 +310,7 @@
       when:
         - inventory_hostname != rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
       no_log: true
 
     - name: Start a new joining control-plane node
@@ -307,6 +321,7 @@
       when:
         - inventory_hostname != rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
 
     - name: Record managed joining control-plane configuration
       ansible.builtin.copy:
@@ -318,6 +333,7 @@
       when:
         - inventory_hostname != rke2_bootstrap_node
         - rke2_state == 'new'
+        - not ansible_check_mode
       no_log: true
 
 - name: Join worker nodes
@@ -338,8 +354,10 @@
       environment:
         INSTALL_RKE2_VERSION: "{{ rke2_version }}"
         INSTALL_RKE2_TYPE: agent
-      when: rke2_state == 'new'
       no_log: true
+      when:
+        - rke2_state == 'new'
+        - not ansible_check_mode
 
     - name: Configure a new worker agent
       ansible.builtin.copy:
@@ -350,15 +368,19 @@
         content: |
           server: https://{{ rke2_registration_endpoint }}:{{ rke2_registration_port }}
           token: {{ hostvars['localhost']['rke2_cluster_token'] }}
-      when: rke2_state == 'new'
       no_log: true
+      when:
+        - rke2_state == 'new'
+        - not ansible_check_mode
 
     - name: Start a new worker agent
       ansible.builtin.service:
         name: rke2-agent
         state: started
         enabled: true
-      when: rke2_state == 'new'
+      when:
+        - rke2_state == 'new'
+        - not ansible_check_mode
 
     - name: Record managed worker configuration
       ansible.builtin.copy:
@@ -367,8 +389,10 @@
         owner: root
         group: root
         mode: '0600'
-      when: rke2_state == 'new'
       no_log: true
+      when:
+        - rke2_state == 'new'
+        - not ansible_check_mode
 
 - name: Verify API and extract kubeconfig
   hosts: localhost
@@ -388,6 +412,7 @@
       retries: "{{ rke2_api_wait_retries }}"
       delay: "{{ rke2_api_wait_delay }}"
       until: rke2_api_check.status in [200, 401, 403]
+      when: not ansible_check_mode
 
     - name: Verify registered Kubernetes nodes from a healthy control-plane member
       ansible.builtin.command: >-
@@ -399,6 +424,7 @@
       changed_when: false
       no_log: true
       failed_when: rke2_registered_nodes.rc != 0
+      when: not ansible_check_mode
 
     - name: Require all inventory nodes to be represented in the API
       ansible.builtin.assert:
@@ -406,6 +432,7 @@
           - (rke2_registered_nodes.stdout_lines | length) >= (groups['control_plane'] | length + groups['worker'] | length)
         fail_msg: "The Kubernetes API did not report all expected control-plane and worker nodes."
       no_log: true
+      when: not ansible_check_mode
 
     - name: Read admin kubeconfig from the selected healthy control-plane member
       ansible.builtin.slurp:
@@ -413,12 +440,14 @@
       delegate_to: "{{ rke2_token_source_node | trim if rke2_token_source_node | trim else rke2_bootstrap_node }}"
       register: rke2_kubeconfig_source
       no_log: true
+      when: not ansible_check_mode
 
     - name: Create protected kubeconfig directory
       ansible.builtin.file:
         path: "{{ rke2_kubeconfig_path | dirname }}"
         state: directory
         mode: '0700'
+      when: not ansible_check_mode
 
     - name: Extract kubeconfig with external API endpoint
       ansible.builtin.copy:
@@ -429,6 +458,7 @@
         dest: "{{ rke2_kubeconfig_path }}"
         mode: '0600'
       no_log: true
+      when: not ansible_check_mode
 
     - name: Report installation completion without secrets
       ansible.builtin.debug:
@@ -440,6 +470,14 @@
           CNI: {{ rke2_cni }}
           Kubeconfig: {{ rke2_kubeconfig_path }} (0600)
           Token: preserved and backed up outside the cluster
+      when: not ansible_check_mode
+
+    - name: Report check-mode validation without claiming installation
+      ansible.builtin.debug:
+        msg: >-
+          RKE2 CHECK MODE — validation only; no installation, service changes,
+          token retrieval, readiness checks, or kubeconfig extraction performed.
+      when: ansible_check_mode
 
 - name: Report per-node RKE2 installation state
   hosts: control_plane:worker
@@ -457,6 +495,12 @@
           RKE2 NODE REPORT — {{ inventory_hostname }} |
           role={{ 'control_plane' if 'control_plane' in group_names else 'worker' }} |
           state={{ rke2_state }} |
-          action={{ 'preserved' if rke2_state == 'matching' else ('installed/joined' if rke2_state == 'new' else 'failed-safely') }} |
+          action={{
+            ('WOULD INITIALIZE' if inventory_hostname == rke2_bootstrap_node else 'WOULD JOIN')
+            if ansible_check_mode and rke2_state == 'new' else
+            ('WOULD PRESERVE' if ansible_check_mode and rke2_state == 'matching' else
+            ('DRIFT DETECTED' if rke2_state == 'drifted' else
+            ('UNSAFE STATE' if rke2_state == 'unknown' else
+            ('preserved' if rke2_state == 'matching' else 'installed/joined')))) }} |
           service={{ ('rke2-server.service' if 'control_plane' in group_names else 'rke2-agent.service') }}={{
             ansible_facts.services.get('rke2-server.service', ansible_facts.services.get('rke2-agent.service', {})).state | default('unknown') }}

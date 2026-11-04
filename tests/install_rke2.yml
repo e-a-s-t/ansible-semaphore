@@ -84,3 +84,48 @@
           - kubeconfig_mode == '0600'
           - generated_token not in report
           - "'token:' not in report"
+
+    - name: Define check-mode state-report fixtures
+      ansible.builtin.set_fact:
+        check_mode_cases:
+          - {name: fresh-bootstrap, host: cp-b, state: new, expected: 'WOULD INITIALIZE'}
+          - {name: fresh-control-plane, host: cp-c, state: new, expected: 'WOULD JOIN'}
+          - {name: fresh-worker, host: worker-a, state: new, expected: 'WOULD JOIN'}
+          - {name: existing-installation, host: cp-b, state: matching, expected: 'WOULD PRESERVE'}
+          - {name: configuration-drift, host: cp-b, state: drifted, expected: 'DRIFT DETECTED'}
+          - {name: unsafe-state, host: cp-b, state: unknown, expected: 'UNSAFE STATE'}
+
+    - name: Assert check-mode report action for each node state
+      ansible.builtin.assert:
+        that:
+          - calculated_action == check_case.expected
+          - calculated_action not in ['COMPLETE', 'installed', 'joined']
+      vars:
+        calculated_action: >-
+          {{ ('WOULD INITIALIZE' if check_case.host == rke2_bootstrap_node else 'WOULD JOIN')
+             if check_case.state == 'new' else
+             ('WOULD PRESERVE' if check_case.state == 'matching' else
+             ('DRIFT DETECTED' if check_case.state == 'drifted' else 'UNSAFE STATE')) }}
+      loop: "{{ check_mode_cases }}"
+      loop_control:
+        loop_var: check_case
+
+    - name: Assert check mode excludes installation-dependent operations
+      ansible.builtin.assert:
+        that:
+          - check_mode_operations | intersect(forbidden_check_mode_operations) | length == 0
+      vars:
+        check_mode_operations:
+          - classify
+          - validate-version
+          - validate-configuration
+          - validate-service-state
+          - report
+        forbidden_check_mode_operations:
+          - install-rke2
+          - write-config
+          - manage-service
+          - retrieve-token
+          - api-readiness
+          - node-registration
+          - extract-kubeconfig
