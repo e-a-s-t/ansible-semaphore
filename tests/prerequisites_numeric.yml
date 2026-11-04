@@ -115,6 +115,80 @@
           - "'invocation' not in report_fixture"
           - "'{' not in report_fixture"
 
+    - name: Build representative validation results for summary rendering
+      ansible.builtin.set_fact:
+        summary_results:
+          - { section: SYSTEM, status: PASS, name: CPU, owner: Infrastructure, explanation: "" }
+          - { section: SYSTEM, status: WARN, name: Operating system, owner: Infrastructure, explanation: "Verify supported OS before installation." }
+          - { section: STORAGE, status: FAIL, name: OS disk, owner: Infrastructure, explanation: "Increase the provisioned OS disk." }
+          - { section: STORAGE, status: SKIP, name: Dedicated role data disk, owner: Infrastructure, explanation: "" }
+          - { section: NETWORK, status: PASS, name: IPv4 address, owner: Infrastructure, explanation: "" }
+          - { section: NETWORK, status: WARN, name: DNS resolvers, owner: Infrastructure, explanation: "Configure DNS resolvers." }
+          - { section: KUBERNETES, status: PASS, name: Swap, owner: Infrastructure, explanation: "" }
+          - { section: KUBERNETES, status: WARN, name: overlay module, owner: Carekube, explanation: "Can be configured during RKE2 installation." }
+          - { section: KUBERNETES, status: SKIP, name: Existing Kubernetes processes, owner: Infrastructure, explanation: "" }
+
+    - name: Render category and action summary fixture
+      ansible.builtin.set_fact:
+        summary_fixture: |
+          SUMMARY BY CATEGORY
+          Category          PASS  WARN  FAIL  SKIP
+          {% for section in ['SYSTEM', 'STORAGE', 'NETWORK', 'KUBERNETES'] %}{{ '%-17s %4d  %4d  %4d  %4d' | format(section, (summary_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'PASS') | list | length), (summary_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'WARN') | list | length), (summary_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'FAIL') | list | length), (summary_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'SKIP') | list | length)) }}
+          {% endfor %}
+          ACTION REQUIRED
+          Infrastructure: resolve before installation | Carekube: resolve during installation
+          Status  Owner          Issue
+          {% for result in summary_results if result.status in ['WARN', 'FAIL'] %}{{ '%-7s %-14s %s' | format(result.status, result.owner, ((result.name ~ ': ' ~ result.explanation) | truncate(56, true, '...'))) }}
+          {% endfor %}
+          OVERALL RESULT: {{ 'NOT READY' if summary_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0 else ('READY WITH WARNINGS' if summary_results | selectattr('status', 'equalto', 'WARN') | list | length > 0 else 'READY') }}
+
+    - name: Assert category counts, ownership, and overall status
+      ansible.builtin.assert:
+        that:
+          - "summary_fixture is search('SYSTEM\\s+1\\s+1\\s+0\\s+0')"
+          - "summary_fixture is search('STORAGE\\s+0\\s+0\\s+1\\s+1')"
+          - "summary_fixture is search('NETWORK\\s+1\\s+1\\s+0\\s+0')"
+          - "summary_fixture is search('KUBERNETES\\s+1\\s+1\\s+0\\s+1')"
+          - "summary_fixture is search('FAIL\\s+Infrastructure\\s+OS disk: Increase the provisioned OS disk.')"
+          - "summary_fixture is search('WARN\\s+Carekube\\s+overlay module: Can be configured during RKE2 installation.')"
+          - "'OVERALL RESULT: NOT READY' in summary_fixture"
+          - "'Infrastructure: resolve before installation' in summary_fixture"
+          - "'Carekube: resolve during installation' in summary_fixture"
+
+    - name: Render clean summary fixture
+      ansible.builtin.set_fact:
+        clean_summary_results:
+          - { section: SYSTEM, status: PASS }
+          - { section: STORAGE, status: PASS }
+          - { section: NETWORK, status: PASS }
+          - { section: KUBERNETES, status: PASS }
+
+    - name: Render clean summary text
+      ansible.builtin.set_fact:
+        clean_summary: |
+          SUMMARY BY CATEGORY
+          Category          PASS  WARN  FAIL  SKIP
+          {% for section in ['SYSTEM', 'STORAGE', 'NETWORK', 'KUBERNETES'] %}{{ '%-17s %4d  %4d  %4d  %4d' | format(section, (clean_summary_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'PASS') | list | length), (clean_summary_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'WARN') | list | length), (clean_summary_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'FAIL') | list | length), (clean_summary_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'SKIP') | list | length)) }}
+          {% endfor %}
+          ACTION REQUIRED
+          Status  Owner          Issue
+          {% for result in clean_summary_results if result.status in ['WARN', 'FAIL'] %}{{ result.status }} {{ result.name }}
+          {% endfor %}
+          OVERALL RESULT: {{ 'NOT READY' if clean_summary_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0 else ('READY WITH WARNINGS' if clean_summary_results | selectattr('status', 'equalto', 'WARN') | list | length > 0 else 'READY') }}
+
+    - name: Assert clean summary rendering has no actions or warnings
+      ansible.builtin.assert:
+        that:
+          - "clean_summary is search('SYSTEM\\s+1\\s+0\\s+0\\s+0')"
+          - "clean_summary is search('STORAGE\\s+1\\s+0\\s+0\\s+0')"
+          - "clean_summary is search('NETWORK\\s+1\\s+0\\s+0\\s+0')"
+          - "clean_summary is search('KUBERNETES\\s+1\\s+0\\s+0\\s+0')"
+          - clean_summary.splitlines() | select('match', '^WARN\\s') | list | length == 0
+          - clean_summary.splitlines() | select('match', '^FAIL\\s') | list | length == 0
+          - "'OVERALL RESULT: READY' in clean_summary"
+          - clean_summary_results | selectattr('status', 'equalto', 'WARN') | list | length == 0
+          - clean_summary_results | selectattr('status', 'equalto', 'FAIL') | list | length == 0
+
     - name: Model callback-safe report and bounded table values
       ansible.builtin.set_fact:
         report_lines:

@@ -247,15 +247,20 @@
           {{ prerequisites_diag.get('block_devices', {}).get('stdout', 'unavailable') | replace('└─', '') | replace('├─', '') | trim }}
           {% endif %}
           {% endfor %}
-          ACTION REQUIRED
+          SUMMARY BY CATEGORY
           ------------------------------------------------------------------------
-          {% for result in prerequisites_results if result.status in ['WARN', 'FAIL'] %}[{{ result.status }}] {{ result.name }} — Owner: {{ result.owner | default('Validation') }}
-             {{ result.explanation | default('Review this diagnostic.') }}
+          Category          PASS  WARN  FAIL  SKIP
+          {% for section in ['SYSTEM', 'STORAGE', 'NETWORK', 'KUBERNETES'] %}{{ '%-17s %4d  %4d  %4d  %4d' | format(section, (prerequisites_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'PASS') | list | length), (prerequisites_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'WARN') | list | length), (prerequisites_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'FAIL') | list | length), (prerequisites_results | selectattr('section', 'equalto', section) | selectattr('status', 'equalto', 'SKIP') | list | length)) }}
           {% endfor %}
-          SUMMARY
+
+          ACTION REQUIRED
+          Infrastructure: resolve before installation | Carekube: resolve during installation
           ------------------------------------------------------------------------
-          PASS: {{ prerequisites_results | selectattr('status', 'equalto', 'PASS') | list | length }} | WARN: {{ prerequisites_results | selectattr('status', 'equalto', 'WARN') | list | length }} | FAIL: {{ prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length }} | SKIP: {{ prerequisites_results | selectattr('status', 'equalto', 'SKIP') | list | length }}
-          Overall: {{ 'NOT READY' if prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0 else ('READY WITH WARNINGS' if prerequisites_results | selectattr('status', 'equalto', 'WARN') | list | length > 0 else 'READY') }}
+          Status  Owner          Issue
+          {% for result in prerequisites_results if result.status in ['WARN', 'FAIL'] %}{{ '%-7s %-14s %s' | format(result.status, result.owner | default('Validation') | truncate(14, true, '...'), ((result.name | default('Check')) ~ ': ' ~ (result.explanation | default('Review this diagnostic.'))) | replace('\n', ' ') | replace('\r', ' ') | truncate(56, true, '...')) }}
+          {% endfor %}
+
+          OVERALL RESULT: {{ 'NOT READY' if prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0 else ('READY WITH WARNINGS' if prerequisites_results | selectattr('status', 'equalto', 'WARN') | list | length > 0 else 'READY') }}
 
     - name: Mark mandatory validation failures after report generation
       ansible.builtin.fail:
