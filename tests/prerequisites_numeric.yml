@@ -39,10 +39,16 @@
         malformed_numeric: "{{ 'not-a-number' | int }}"
         missing_cpu_raw: ""
         missing_memory_raw: ""
+
+    - name: Derive unavailable diagnostic statuses
+      ansible.builtin.set_fact:
         missing_cpu_valid: "{{ missing_cpu_raw is match('^[0-9]+$') }}"
         missing_memory_valid: "{{ missing_memory_raw is match('^[0-9]+([.][0-9]+)?$') }}"
         missing_status: "{{ 'WARN' if not (missing_valid | bool) else 'FAIL' }}"
         malformed_status: "{{ 'WARN' if not (malformed_valid | bool) else 'FAIL' }}"
+
+    - name: Derive unavailable CPU and memory statuses
+      ansible.builtin.set_fact:
         missing_cpu_status: "{{ 'WARN' if not (missing_cpu_valid | bool) else 'FAIL' }}"
         missing_memory_status: "{{ 'WARN' if not (missing_memory_valid | bool) else 'FAIL' }}"
 
@@ -63,3 +69,48 @@
         that:
           - ("FAIL" if ("90000000000" | int) < ((test_requirements.os_disk_gb | int) * 1000000000) else "PASS") == "FAIL"
           - ("FAIL" if ("400000000000" | int) < ((test_requirements.data_disk_gb | int) * 1000000000) else "PASS") == "FAIL"
+
+    - name: Model conservative storage, DNS, and time diagnostics
+      ansible.builtin.set_fact:
+        ambiguous_disk_status: "{{ 'PASS' if '/dev/mapper/root lvm 50000000000' is match('^[^ ]+[ ]+disk[ ]+[0-9]+$') else 'WARN' }}"
+        loopback_hostname_status: "{{ 'PASS' if ['127.0.1.1'] | select('in', ['192.168.50.165']) | list | length > 0 else 'WARN' }}"
+        unsynchronized_time_status: "{{ 'PASS' if ('yes' in 'no' and 'leap status: normal' in '') else 'WARN' }}"
+
+    - name: Assert ambiguous infrastructure evidence is not promoted to PASS
+      ansible.builtin.assert:
+        that:
+          - ambiguous_disk_status == "WARN"
+          - loopback_hostname_status == "WARN"
+          - unsynchronized_time_status == "WARN"
+
+    - name: Render a compact report fixture
+      ansible.builtin.set_fact:
+        report_fixture: |
+          RKE2 PREREQUISITES — basel-rke2-01
+          Inventory: basel-rke2-01
+          Role: control_plane
+
+          SYSTEM
+          Check                        Status  Actual                             Required
+          Memory                       PASS    7.75 GiB visible to Linux          8 GiB provisioned*
+
+          STORAGE
+          OS disk                      WARN    unknown disk                       100 GB provisioned
+
+          NETWORK
+          Hostname resolution          WARN    127.0.1.1                         Node IP
+
+          SUMMARY
+          PASS: 1 | WARN: 2 | FAIL: 0 | SKIP: 0
+
+    - name: Assert report formatting is human-readable and does not expose raw diagnostics
+      ansible.builtin.assert:
+        that:
+          - "'SYSTEM' in report_fixture"
+          - "'STORAGE' in report_fixture"
+          - "'NETWORK' in report_fixture"
+          - "'SUMMARY' in report_fixture"
+          - "'[WARN]' not in report_fixture or 'OS disk' in report_fixture"
+          - "'stdout' not in report_fixture"
+          - "'invocation' not in report_fixture"
+          - "'{' not in report_fixture"

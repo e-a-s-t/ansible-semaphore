@@ -30,9 +30,10 @@
           section: SYSTEM
           name: Node role assignment
           status: "{{ 'PASS' if prerequisites_role_memberships | length == 1 else 'FAIL' }}"
-          detail: >-
-            {{ prerequisites_role if prerequisites_role_memberships | length == 1
-               else 'Expected exactly one role group; found ' ~ (prerequisites_role_memberships | join(', ') if prerequisites_role_memberships else 'none') }}
+          actual: "{{ prerequisites_role }}"
+          required: Exactly one role
+          explanation: "{{ 'Inventory role is valid.' if prerequisites_role_memberships | length == 1 else 'Assign the host to exactly one role group.' }}"
+          owner: Infrastructure
 
   tasks:
     - name: Collect read-only diagnostic data
@@ -40,16 +41,15 @@
       loop:
         - { key: hostname_fqdn, command: "hostname --fqdn" }
         - { key: python3, command: "command -v python3" }
-        - { key: block_devices, command: "lsblk --json --bytes --output NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS" }
-        - { key: mounts, command: "findmnt --json" }
-        - { key: root_df, command: "df -B1 --output=source,size,avail,target /" }
+        - { key: block_devices, command: "lsblk -rpnbo NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS | awk '{printf \"%s | %s | %.2f GB | %s | %s\\n\", $1, $2, $3/1000000000, $4, ($5 == \"\" ? \"-\" : $5)}'" }
+        - { key: root_source, command: "findmnt -n -o SOURCE /" }
+        - { key: root_partition_size, command: "findmnt -n -o SOURCE / | xargs -r lsblk -bno SIZE" }
+        - { key: root_disk, command: "findmnt -n -o SOURCE / | xargs -r lsblk -s -b -n -o NAME,TYPE,SIZE | awk '$2 == \"disk\" {line=$0} END {print line}'" }
         - { key: root_filesystem_size, command: "df -B1 --output=size / | tail -n 1 | tr -d '[:space:]'" }
-        - { key: root_parent, command: "findmnt -n -o SOURCE / | xargs -r lsblk -no PKNAME" }
-        - { key: root_disk_size, command: "findmnt -n -o SOURCE / | xargs -r lsblk -bno SIZE" }
-        - { key: hostname_resolution, command: "getent hosts $(hostname --fqdn)" }
-        - { key: ipv4, command: "ip -4 -o addr show scope global" }
+        - { key: root_filesystem_available, command: "df -B1 --output=avail / | tail -n 1 | tr -d '[:space:]'" }
+        - { key: hostname_resolution, command: "getent ahostsv4 $(hostname --fqdn) | awk '{print $1}' | sort -u" }
+        - { key: ipv4, command: "ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1" }
         - { key: default_route, command: "ip route show default" }
-        - { key: routes, command: "ip route show" }
         - { key: resolv_conf, command: "awk '/^[[:space:]]*nameserver[[:space:]]/ {print $2}' /etc/resolv.conf" }
         - { key: swap, command: "cat /proc/swaps" }
         - { key: modules, command: "lsmod" }
@@ -58,21 +58,25 @@
         - { key: iptables, command: "command -v iptables" }
         - { key: nft, command: "command -v nft" }
         - { key: iscsiadm, command: "command -v iscsiadm" }
-        - { key: filesystem_tools, command: "command -v mkfs.ext4" }
-        - { key: systemd_time, command: "timedatectl show --property=Timezone,NTP,synchronized --value" }
+        - { key: systemd_time_ntp, command: "timedatectl show --property=NTP --value" }
+        - { key: systemd_time_sync, command: "timedatectl show --property=NTPSynchronized --value" }
         - { key: chrony, command: "command -v chronyc" }
+        - { key: chrony_tracking, command: "chronyc tracking" }
         - { key: timesyncd, command: "systemctl is-enabled systemd-timesyncd" }
         - { key: kubernetes_processes, command: "ps -eo pid,args | grep -E '[r]ke2|[k]ubelet|[k]3s'" }
-        - { key: listening_ports, command: "ss -lntup" }
       register: prerequisites_diagnostics
       changed_when: false
       failed_when: false
+      no_log: true
+      loop_control:
+        label: "{{ item.key }}"
 
     - name: Inspect the explicitly configured dedicated data disk
       ansible.builtin.shell: "lsblk -bno SIZE {{ prerequisites_data_disk_device | quote }}"
       register: prerequisites_data_disk
       changed_when: false
       failed_when: false
+      no_log: true
       when:
         - prerequisites_role in ['worker', 'backup']
         - prerequisites_data_disk_device | default('') | trim | length > 0
@@ -80,18 +84,9 @@
     - name: Collect configured endpoint diagnostics
       ansible.builtin.shell: >-
         set -o pipefail;
-        if ! getent ahosts {{ item.host | quote }} >/dev/null; then
-          echo DNS_FAILED; exit 0;
-        fi;
-        if ! timeout {{ item.timeout | default(5) }} bash -c
-        'cat < /dev/null > /dev/tcp/{{ item.host }}/{{ item.port }}' 2>/dev/null; then
-          echo TCP_FAILED; exit 0;
-        fi;
-        {% if item.tls | default(false) | bool %}
-        if ! timeout {{ item.timeout | default(5) }} openssl s_client -connect {{ item.host }}:{{ item.port }} -servername {{ item.host }} </dev/null >/dev/null 2>&1; then
-          echo TLS_FAILED; exit 0;
-        fi;
-        {% endif %}
+        if ! getent ahosts {{ item.host | quote }} >/dev/null; then echo DNS_FAILED; exit 0; fi;
+        if ! timeout {{ item.timeout | default(5) }} bash -c 'cat < /dev/null > /dev/tcp/{{ item.host }}/{{ item.port }}' 2>/dev/null; then echo TCP_FAILED; exit 0; fi;
+        {% if item.tls | default(false) | bool %}if ! timeout {{ item.timeout | default(5) }} openssl s_client -connect {{ item.host }}:{{ item.port }} -servername {{ item.host }} </dev/null >/dev/null 2>&1; then echo TLS_FAILED; exit 0; fi;{% endif %}
         echo OK
       args:
         executable: /bin/bash
@@ -99,189 +94,106 @@
       register: prerequisites_endpoint_diagnostics
       changed_when: false
       failed_when: false
+      no_log: true
       when: prerequisites_network_endpoints | length > 0
 
-    - name: Convert diagnostic output to a lookup
+    - name: Convert diagnostic output to an internal lookup
       ansible.builtin.set_fact:
-        prerequisites_diag: "{{ prerequisites_diag | default({}) | combine({item.item.key: item}) }}"
+        prerequisites_diag: "{{ prerequisites_diag | default({}) | combine({item.item.key: {'stdout': item.stdout | default(''), 'stdout_lines': item.stdout_lines | default([]), 'rc': item.rc | default(1)}}) }}"
       loop: "{{ prerequisites_diagnostics.results }}"
+      no_log: true
+      loop_control:
+        label: "{{ item.item.key }}"
 
-    - name: Normalize numeric diagnostic values
+    - name: Normalize diagnostic values
       ansible.builtin.set_fact:
-        prerequisites_root_disk_raw: "{{ prerequisites_diag.get('root_disk_size', {}).get('stdout', '') | string | trim }}"
+        prerequisites_root_disk_raw: "{{ prerequisites_diag.get('root_disk', {}).get('stdout', '') | string | trim }}"
+        prerequisites_root_partition_raw: "{{ prerequisites_diag.get('root_partition_size', {}).get('stdout', '') | string | trim }}"
         prerequisites_root_filesystem_raw: "{{ prerequisites_diag.get('root_filesystem_size', {}).get('stdout', '') | string | trim }}"
-        prerequisites_root_disk_numeric: "{{ prerequisites_diag.get('root_disk_size', {}).get('stdout', '') | string | trim | int }}"
-        prerequisites_root_filesystem_numeric: "{{ prerequisites_diag.get('root_filesystem_size', {}).get('stdout', '') | string | trim | int }}"
-        prerequisites_root_disk_valid: "{{ (prerequisites_diag.get('root_disk_size', {}).get('stdout', '') | string | trim) is match('^[0-9]+$') }}"
+        prerequisites_root_available_raw: "{{ prerequisites_diag.get('root_filesystem_available', {}).get('stdout', '') | string | trim }}"
+        prerequisites_root_disk_valid: "{{ (prerequisites_diag.get('root_disk', {}).get('stdout', '') | string | trim) is match('^[^|]+[[:space:]]+disk[[:space:]]+[0-9]+') }}"
+        prerequisites_root_partition_valid: "{{ (prerequisites_diag.get('root_partition_size', {}).get('stdout', '') | string | trim) is match('^[0-9]+$') }}"
         prerequisites_root_filesystem_valid: "{{ (prerequisites_diag.get('root_filesystem_size', {}).get('stdout', '') | string | trim) is match('^[0-9]+$') }}"
+        prerequisites_root_available_valid: "{{ (prerequisites_diag.get('root_filesystem_available', {}).get('stdout', '') | string | trim) is match('^[0-9]+$') }}"
 
-    - name: Validate system, operating system, CPU, and memory
+    - name: Validate system requirements
       ansible.builtin.set_fact:
         prerequisites_results: "{{ prerequisites_results + validation_items }}"
       vars:
-        role_requirements: "{{ prerequisites_requirements[prerequisites_role] | default({}) }}"
-        os_name: "{{ ansible_facts.distribution | default('Unknown') }}"
-        os_version: "{{ ansible_facts.distribution_version | default('unknown') }}"
-        os_supported: "{{ (os_name == 'Ubuntu' and os_version is version('24.04', '==')) or (os_name == 'Debian' and os_version is version('13', '==')) }}"
-        cpu_raw: "{{ ansible_facts.get('processor_vcpus', '') | string | trim }}"
-        memory_raw: "{{ ansible_facts.get('memtotal_mb', '') | string | trim }}"
-        cpu_valid: "{{ cpu_raw is match('^[0-9]+$') }}"
-        memory_valid: "{{ memory_raw is match('^[0-9]+([.][0-9]+)?$') }}"
-        actual_memory_gib: "{{ ((memory_raw | float) / 1024) | round(2) }}"
-        memory_minimum: "{{ (role_requirements.get('memory_gib', 0) | float) * (1 - (prerequisites_memory_tolerance | float)) }}"
+        req: "{{ prerequisites_requirements[prerequisites_role] | default({}) }}"
+        cpu: "{{ ansible_facts.get('processor_vcpus', '') | string | trim }}"
+        mem: "{{ ansible_facts.get('memtotal_mb', '') | string | trim }}"
+        mem_gib: "{{ ((mem | float) / 1024) | round(2) }}"
+        mem_min: "{{ (req.get('memory_gib', 0) | float) * (1 - prerequisites_memory_tolerance | float) }}"
         validation_items:
-          - section: SYSTEM
-            name: Operating system
-            status: "{{ 'PASS' if os_supported else 'WARN' }}"
-            detail: "{{ os_name }} {{ os_version }}"
-          - section: SYSTEM
-            name: Kernel
-            status: PASS
-            detail: "{{ ansible_facts.kernel | default('unavailable') }}"
-          - section: SYSTEM
-            name: Architecture
-            status: "{{ 'PASS' if ansible_facts.architecture | default('') in ['x86_64', 'amd64'] else 'FAIL' }}"
-            detail: "{{ ansible_facts.architecture | default('unavailable') }}"
-          - section: SYSTEM
-            name: Python availability
-            status: "{{ 'PASS' if (prerequisites_diag.get('python3', {}).get('rc', 1) | int) == 0 else 'WARN' }}"
-            detail: "{{ prerequisites_diag.python3.stdout | default('python3 unavailable') | trim }}"
-          - section: SYSTEM
-            name: CPU
-            status: "{{ 'PASS' if (cpu_valid | bool) and (cpu_raw | int) >= (role_requirements.get('vcpu', 0) | int) else ('FAIL' if cpu_valid | bool else 'WARN') }}"
-            detail: "{{ cpu_raw | int }} vCPU (required: {{ role_requirements.get('vcpu', 'unknown') }})"
-          - section: SYSTEM
-            name: Memory
-            status: "{{ 'PASS' if (memory_valid | bool) and (actual_memory_gib | float) >= (role_requirements.get('memory_gib', 0) | float) else ('WARN' if (not memory_valid | bool) or (actual_memory_gib | float) >= (memory_minimum | float) else 'FAIL') }}"
-            detail: "{{ actual_memory_gib | float }} GiB (required: {{ role_requirements.get('memory_gib', 'unknown') }} GiB, tolerance: {{ ((prerequisites_memory_tolerance | float) * 100) | round(1) }}%)"
+          - { section: SYSTEM, name: Operating system, status: "{{ 'PASS' if ((ansible_facts.distribution | default('')) == 'Ubuntu' and (ansible_facts.distribution_version | default('')) is version('24.04', '==')) or ((ansible_facts.distribution | default('')) == 'Debian' and (ansible_facts.distribution_version | default('')) is version('13', '==')) else 'WARN' }}", actual: "{{ ansible_facts.distribution | default('Unknown') }} {{ ansible_facts.distribution_version | default('unknown') }}", required: "Ubuntu 24.04 or Debian 13", explanation: "Verify RKE2 compatibility for unsupported OS versions.", owner: Infrastructure }
+          - { section: SYSTEM, name: Kernel, status: PASS, actual: "{{ ansible_facts.kernel | default('unavailable') }}", required: Supported Linux kernel, explanation: "", owner: Validation }
+          - { section: SYSTEM, name: Architecture, status: "{{ 'PASS' if ansible_facts.architecture | default('') in ['x86_64', 'amd64'] else 'FAIL' }}", actual: "{{ ansible_facts.architecture | default('unavailable') }}", required: x86_64, explanation: "Use an x86_64 VM.", owner: Infrastructure }
+          - { section: SYSTEM, name: CPU, status: "{{ 'PASS' if cpu is match('^[0-9]+$') and cpu | int >= req.get('vcpu', 0) | int else ('FAIL' if cpu is match('^[0-9]+$') else 'WARN') }}", actual: "{{ cpu | int }} vCPU", required: "{{ req.get('vcpu', 'unknown') }} vCPU", explanation: "Increase the VM vCPU allocation.", owner: Infrastructure }
+          - { section: SYSTEM, name: Memory, status: "{{ 'PASS' if mem is match('^[0-9]+([.][0-9]+)?$') and mem_gib | float >= mem_min | float else ('FAIL' if mem is match('^[0-9]+([.][0-9]+)?$') else 'WARN') }}", actual: "{{ mem_gib }} GiB visible to Linux", required: "{{ req.get('memory_gib', 'unknown') }} GiB provisioned*", explanation: "Within tolerance; *Linux-visible memory may be lower because of kernel reservations.", owner: Infrastructure }
+          - { section: SYSTEM, name: Python, status: "{{ 'PASS' if prerequisites_diag.get('python3', {}).get('rc', 1) | int == 0 else 'WARN' }}", actual: "{{ prerequisites_diag.get('python3', {}).get('stdout', 'unavailable') | trim }}", required: python3 available, explanation: "Python is unavailable to Ansible.", owner: Validation }
 
-    - name: Validate root filesystem capacity
+    - name: Validate storage requirements
       ansible.builtin.set_fact:
-        prerequisites_results: "{{ prerequisites_results + [root_disk_result] }}"
+        prerequisites_results: "{{ prerequisites_results + storage_items }}"
       vars:
-        role_requirements: "{{ prerequisites_requirements[prerequisites_role] | default({}) }}"
-        root_disk_result:
-          section: STORAGE
-          name: OS disk
-          status: >-
-            {{ 'PASS' if (prerequisites_root_disk_valid | bool) and
-               ((prerequisites_root_disk_numeric | int) >= ((role_requirements.get('os_disk_gb', 0) | int) * 1000000000))
-               else ('FAIL' if (prerequisites_root_disk_valid | bool) and (prerequisites_root_disk_numeric | int) > 0 else 'WARN') }}
-          detail: >-
-            Provisioned root disk: {{ ((prerequisites_root_disk_numeric | int) / 1000000000) | round(2) }} GB;
-            filesystem capacity: {{ ((prerequisites_root_filesystem_numeric | int) / 1000000000) | round(2) }} GB;
-            device: {{ prerequisites_diag.get('root_parent', {}).get('stdout', 'unavailable') | string | trim }}
+        req: "{{ prerequisites_requirements[prerequisites_role] | default({}) }}"
+        disk_size: "{{ prerequisites_root_disk_raw.split()[2] | default('') }}"
+        disk_name: "{{ prerequisites_root_disk_raw.split()[0] | default('unknown') }}"
+        disk_valid: "{{ prerequisites_root_disk_raw is match('^[^ ]+[ ]+disk[ ]+[0-9]+$') }}"
+        data_raw: "{{ prerequisites_data_disk.stdout | default('') | trim }}"
+        data_valid: "{{ data_raw is match('^[0-9]+$') }}"
+        storage_items:
+          - { section: STORAGE, name: OS disk, status: "{{ 'PASS' if disk_valid and disk_size | int >= req.get('os_disk_gb', 0) | int * 1000000000 else ('FAIL' if disk_valid else 'WARN') }}", actual: "{{ ((disk_size | int) / 1000000000) | round(2) }} GB provisioned on {{ disk_name if disk_valid else 'unknown disk' }}", required: "{{ req.get('os_disk_gb', 'unknown') }} GB provisioned", explanation: "{{ '' if disk_valid and disk_size | int >= req.get('os_disk_gb', 0) | int * 1000000000 else ('Increase the provisioned OS disk.' if disk_valid else 'Underlying disk cannot be identified reliably; verify VM storage. An unmounted disk is not inferred safe.') }}", owner: Infrastructure }
+          - { section: STORAGE, name: Root partition/device, status: "{{ 'PASS' if prerequisites_root_partition_valid else 'WARN' }}", actual: "{{ (((prerequisites_root_partition_raw | int) / 1000000000) | round(2) ~ ' GB') if prerequisites_root_partition_valid else 'unknown' }}", required: Root device present, explanation: "Root partition or logical-volume size is unavailable.", owner: Validation }
+          - { section: STORAGE, name: Root filesystem, status: "{{ 'PASS' if prerequisites_root_filesystem_valid and prerequisites_root_available_valid else 'WARN' }}", actual: "{{ (((prerequisites_root_filesystem_raw | int) / 1000000000) | round(2) ~ ' GB capacity; ' ~ ((prerequisites_root_available_raw | int) / 1000000000) | round(2) ~ ' GB available') if prerequisites_root_filesystem_valid and prerequisites_root_available_valid else 'unknown' }}", required: Mounted filesystem available, explanation: "Root filesystem capacity or available space is unavailable.", owner: Validation }
+          - { section: STORAGE, name: Block devices, status: PASS, actual: "{{ prerequisites_diag.get('block_devices', {}).get('stdout', 'unavailable') | trim }}", required: "device | type | size | filesystem | mount", explanation: "", owner: Validation }
+          - { section: STORAGE, name: Dedicated role data disk, status: "{{ 'SKIP' if prerequisites_role not in ['worker', 'backup'] else ('WARN' if prerequisites_data_disk_device | default('') | trim == '' or not data_valid else ('PASS' if data_raw | int >= req.get('data_disk_gb', 0) | int * 1000000000 else 'FAIL')) }}", actual: "{{ 'Not required' if prerequisites_role not in ['worker', 'backup'] else (prerequisites_data_disk_device if prerequisites_data_disk_device | default('') | trim == '' else (((data_raw | int) / 1000000000) | round(2) ~ ' GB on ' ~ prerequisites_data_disk_device)) }}", required: "{{ req.get('data_disk_gb', 'unknown') }} GB on explicit device", explanation: "{{ 'Configure an explicit dedicated disk; an unmounted disk is not inferred safe.' if prerequisites_role in ['worker', 'backup'] and (prerequisites_data_disk_device | default('') | trim == '' or not data_valid) else ('Increase the configured dedicated data disk.' if prerequisites_role in ['worker', 'backup'] and data_valid and data_raw | int < req.get('data_disk_gb', 0) | int * 1000000000 else '') }}", owner: Infrastructure }
 
     - name: Validate networking
       ansible.builtin.set_fact:
         prerequisites_results: "{{ prerequisites_results + network_items }}"
       vars:
+        resolved: "{{ prerequisites_diag.get('hostname_resolution', {}).get('stdout', '') | trim }}"
+        addresses: "{{ prerequisites_diag.get('ipv4', {}).get('stdout', '') | trim }}"
+        has_global: "{{ resolved.splitlines() | select('in', addresses.split() | list) | list | length > 0 }}"
+        loopback_only: "{{ resolved and resolved.splitlines() | reject('match', '^127\\.') | list | length == 0 }}"
         network_items:
-          - section: NETWORK
-            name: Hostname and FQDN
-            status: "{{ 'PASS' if (prerequisites_diag.get('hostname_fqdn', {}).get('rc', 1) | int) == 0 else 'WARN' }}"
-            detail: "{{ prerequisites_diag.hostname_fqdn.stdout | default('unavailable') | trim }}"
-          - section: NETWORK
-            name: IPv4 address configured
-            status: "{{ 'PASS' if prerequisites_diag.ipv4.stdout | default('') | trim else 'FAIL' }}"
-            detail: "{{ prerequisites_diag.ipv4.stdout | default('none') | trim }}"
-          - section: NETWORK
-            name: Default route available
-            status: "{{ 'PASS' if prerequisites_diag.default_route.stdout | default('') | trim else 'FAIL' }}"
-            detail: "{{ prerequisites_diag.default_route.stdout | default('none') | trim }}"
-          - section: NETWORK
-            name: DNS resolvers configured
-            status: "{{ 'PASS' if prerequisites_diag.resolv_conf.stdout | default('') | trim else 'WARN' }}"
-            detail: "{{ prerequisites_diag.resolv_conf.stdout | default('none') | trim }}"
-          - section: NETWORK
-            name: Local hostname resolution
-            status: "{{ 'PASS' if (prerequisites_diag.get('hostname_resolution', {}).get('rc', 1) | int) == 0 else 'WARN' }}"
-            detail: "{{ prerequisites_diag.hostname_resolution.stdout | default('unavailable') | trim }}"
+          - { section: NETWORK, name: IPv4 address, status: "{{ 'PASS' if addresses else 'FAIL' }}", actual: "{{ addresses if addresses else 'none' }}", required: Global IPv4 address, explanation: "Assign a routable IPv4 address.", owner: Infrastructure }
+          - { section: NETWORK, name: Default route, status: "{{ 'PASS' if prerequisites_diag.get('default_route', {}).get('stdout', '') | trim else 'FAIL' }}", actual: "{{ prerequisites_diag.get('default_route', {}).get('stdout', 'none') | trim }}", required: Default route, explanation: "Configure a default route.", owner: Infrastructure }
+          - { section: NETWORK, name: Hostname resolution, status: "{{ 'PASS' if has_global else 'WARN' }}", actual: "{{ resolved if resolved else 'unavailable' }}", required: Hostname resolves to node IP, explanation: "{{ '' if has_global else ('Hostname resolves only to loopback; map it to the routable node address.' if loopback_only else 'Hostname does not resolve to a routable node address.') }}", owner: Infrastructure }
+          - { section: NETWORK, name: DNS resolvers, status: "{{ 'PASS' if prerequisites_diag.get('resolv_conf', {}).get('stdout', '') | trim else 'WARN' }}", actual: "{{ prerequisites_diag.get('resolv_conf', {}).get('stdout', 'none') | trim }}", required: Configured resolvers, explanation: "Configure DNS resolvers.", owner: Infrastructure }
 
     - name: Validate time synchronization
       ansible.builtin.set_fact:
         prerequisites_results: "{{ prerequisites_results + [time_result] }}"
       vars:
+        synchronized: "{{ prerequisites_diag.get('systemd_time_sync', {}).get('stdout', '') | trim | lower in ['yes', 'true'] or 'leap status: normal' in prerequisites_diag.get('chrony_tracking', {}).get('stdout', '') | lower }}"
+        service_present: "{{ prerequisites_diag.get('chrony', {}).get('rc', 1) | int == 0 or prerequisites_diag.get('timesyncd', {}).get('rc', 1) | int == 0 }}"
         time_result:
           section: NETWORK
           name: Time synchronization
-          status: "{{ 'PASS' if 'yes' in (prerequisites_diag.systemd_time.stdout | default('') | lower) else 'WARN' }}"
-          detail: "{{ prerequisites_diag.systemd_time.stdout | default('status unavailable') | trim }}"
+          status: "{{ 'PASS' if synchronized else 'WARN' }}"
+          actual: "{{ 'Synchronized' if synchronized else ('Service installed/enabled but not synchronized' if service_present else 'Unknown') }}"
+          required: Clock synchronized
+          explanation: "{{ '' if synchronized else 'Verify actual synchronization; enabled service alone is insufficient.' }}"
+          owner: Infrastructure
 
-    - name: Validate Kubernetes and Longhorn prerequisites
+    - name: Validate Kubernetes requirements
       ansible.builtin.set_fact:
         prerequisites_results: "{{ prerequisites_results + kube_items }}"
       vars:
-        role_requirements: "{{ prerequisites_requirements[prerequisites_role] | default({}) }}"
-        swap_active: "{{ (prerequisites_diag.get('swap', {}).get('stdout_lines', []) | length) > 1 }}"
-        modules_text: "{{ prerequisites_diag.get('modules', {}).get('stdout', '') | string }}"
-        data_disk_raw: "{{ (prerequisites_data_disk | default({})).get('stdout', '') | string | trim }}"
-        data_disk_valid: "{{ data_disk_raw is match('^[0-9]+$') }}"
+        modules: "{{ prerequisites_diag.get('modules', {}).get('stdout', '') }}"
+        swap: "{{ prerequisites_diag.get('swap', {}).get('stdout_lines', []) | length > 1 }}"
         kube_items:
-          - section: KUBERNETES
-            name: Swap disabled
-            status: "{{ 'FAIL' if swap_active and prerequisites_role in ['control_plane', 'worker'] else ('SKIP' if prerequisites_role == 'backup' else 'PASS') }}"
-            detail: "{{ 'Active swap detected' if swap_active else 'No active swap detected' }}"
-          - section: KUBERNETES
-            name: overlay module
-            status: "{{ 'PASS' if 'overlay' in modules_text else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}"
-            detail: "{{ 'Loaded' if 'overlay' in modules_text else 'Not loaded; installation may configure it' }}"
-          - section: KUBERNETES
-            name: br_netfilter module
-            status: "{{ 'PASS' if 'br_netfilter' in modules_text else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}"
-            detail: "{{ 'Loaded' if 'br_netfilter' in modules_text else 'Not loaded; installation may configure it' }}"
-          - section: KUBERNETES
-            name: IPv4 forwarding
-            status: "{{ 'PASS' if prerequisites_diag.get('ip_forward', {}).get('stdout', '') | string | trim == '1' else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}"
-            detail: "{{ prerequisites_diag.ip_forward.stdout | default('unavailable') | trim }}"
-          - section: KUBERNETES
-            name: bridge-nf-call-iptables
-            status: "{{ 'PASS' if prerequisites_diag.get('bridge_iptables', {}).get('stdout', '') | string | trim == '1' else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}"
-            detail: "{{ prerequisites_diag.bridge_iptables.stdout | default('unavailable') | trim }}; installation may configure it"
-          - section: KUBERNETES
-            name: iptables or nftables available
-            status: "{{ 'PASS' if (prerequisites_diag.get('iptables', {}).get('rc', 1) | int) == 0 or (prerequisites_diag.get('nft', {}).get('rc', 1) | int) == 0 else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}"
-            detail: "Read-only utility availability check"
-          - section: KUBERNETES
-            name: Existing Kubernetes/RKE2 installation
-            status: "{{ 'WARN' if prerequisites_diag.kubernetes_processes.stdout | default('') | trim else ('SKIP' if prerequisites_role == 'backup' else 'PASS') }}"
-            detail: "{{ prerequisites_diag.kubernetes_processes.stdout | default('none detected') | trim }}"
-          - section: STORAGE
-            name: Discovered block devices
-            status: PASS
-            detail: "{{ prerequisites_diag.block_devices.stdout | default('unavailable') | trim }}"
-          - section: STORAGE
-            name: Discovered mounts
-            status: PASS
-            detail: "{{ prerequisites_diag.mounts.stdout | default('unavailable') | trim }}"
-          - section: STORAGE
-            name: Dedicated Longhorn data disk
-            status: >-
-              {{ 'SKIP' if prerequisites_role != 'worker' else
-                 ('WARN' if (prerequisites_data_disk_device | default('') | trim) == '' else
-                 ('WARN' if not (data_disk_valid | bool) else
-                 ('PASS' if (data_disk_raw | int) >= ((role_requirements.get('data_disk_gb', 0) | int) * 1000000000) else 'FAIL'))) }}
-            detail: >-
-              {{ 'Not required' if prerequisites_role != 'worker' else
-                 ('No explicit data disk configured; identity is ambiguous' if (prerequisites_data_disk_device | default('') | trim) == '' else
-                 (prerequisites_data_disk_device ~ ': ' ~ ((data_disk_raw | int / 1000000000) | round(2)) ~ ' GB' if data_disk_valid | bool else
-                 prerequisites_data_disk_device ~ ': unavailable or malformed size')) }}
-          - section: STORAGE
-            name: Dedicated backup data disk
-            status: >-
-              {{ 'SKIP' if prerequisites_role != 'backup' else
-                 ('WARN' if (prerequisites_data_disk_device | default('') | trim) == '' else
-                 ('WARN' if not (data_disk_valid | bool) else
-                 ('PASS' if (data_disk_raw | int) >= ((role_requirements.get('data_disk_gb', 0) | int) * 1000000000) else 'FAIL'))) }}
-            detail: >-
-              {{ 'Not required' if prerequisites_role != 'backup' else
-                 ('No explicit backup disk configured; identity is ambiguous' if (prerequisites_data_disk_device | default('') | trim) == '' else
-                 (prerequisites_data_disk_device ~ ': ' ~ ((data_disk_raw | int / 1000000000) | round(2)) ~ ' GB' if data_disk_valid | bool else
-                 prerequisites_data_disk_device ~ ': unavailable or malformed size')) }}
-          - section: STORAGE
-            name: iSCSI initiator tools
-            status: "{{ 'PASS' if prerequisites_role == 'worker' and (prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int) == 0 else ('WARN' if prerequisites_role == 'worker' else 'SKIP') }}"
-            detail: "{{ 'iscsiadm available' if (prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int) == 0 else 'iscsiadm unavailable; installation may install it' }}"
+          - { section: KUBERNETES, name: Swap, status: "{{ 'FAIL' if swap and prerequisites_role in ['control_plane', 'worker'] else ('SKIP' if prerequisites_role == 'backup' else 'PASS') }}", actual: "{{ 'Enabled' if swap else 'Disabled' }}", required: Disabled, explanation: "Disable swap before RKE2 installation.", owner: Infrastructure }
+          - { section: KUBERNETES, name: overlay module, status: "{{ 'PASS' if 'overlay' in modules else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ 'Loaded' if 'overlay' in modules else 'Not loaded' }}", required: Loaded, explanation: "Can be configured during RKE2 installation.", owner: Carekube }
+          - { section: KUBERNETES, name: br_netfilter module, status: "{{ 'PASS' if 'br_netfilter' in modules else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ 'Loaded' if 'br_netfilter' in modules else 'Not loaded' }}", required: Loaded, explanation: "Can be configured during RKE2 installation.", owner: Carekube }
+          - { section: KUBERNETES, name: IPv4 forwarding, status: "{{ 'PASS' if prerequisites_diag.get('ip_forward', {}).get('stdout', '') | trim == '1' else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ prerequisites_diag.get('ip_forward', {}).get('stdout', 'unknown') | trim }}", required: Enabled, explanation: "Can be configured during RKE2 installation.", owner: Carekube }
+          - { section: KUBERNETES, name: bridge-nf-call-iptables, status: "{{ 'PASS' if prerequisites_diag.get('bridge_iptables', {}).get('stdout', '') | trim == '1' else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ prerequisites_diag.get('bridge_iptables', {}).get('stdout', 'unknown') | trim }}", required: Enabled, explanation: "Can be configured during RKE2 installation.", owner: Carekube }
+          - { section: KUBERNETES, name: iptables or nftables, status: "{{ 'PASS' if prerequisites_diag.get('iptables', {}).get('rc', 1) | int == 0 or prerequisites_diag.get('nft', {}).get('rc', 1) | int == 0 else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ 'Available' if prerequisites_diag.get('iptables', {}).get('rc', 1) | int == 0 or prerequisites_diag.get('nft', {}).get('rc', 1) | int == 0 else 'Unavailable' }}", required: Firewall utility available, explanation: "Install or provide iptables/nftables before RKE2 installation.", owner: Carekube }
+          - { section: KUBERNETES, name: Existing Kubernetes processes, status: "{{ 'WARN' if prerequisites_diag.get('kubernetes_processes', {}).get('stdout', '') | trim else ('SKIP' if prerequisites_role == 'backup' else 'PASS') }}", actual: "{{ 'Detected' if prerequisites_diag.get('kubernetes_processes', {}).get('stdout', '') | trim else 'None detected' }}", required: No existing installation, explanation: "Review existing processes before installation.", owner: Infrastructure }
+          - { section: STORAGE, name: iSCSI initiator tools, status: "{{ 'PASS' if prerequisites_role == 'worker' and prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int == 0 else ('WARN' if prerequisites_role == 'worker' else 'SKIP') }}", actual: "{{ 'Available' if prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int == 0 else 'Unavailable' }}", required: iscsiadm on workers, explanation: "Can be installed during RKE2/Longhorn preparation.", owner: Carekube }
 
     - name: Validate configured network endpoints
       ansible.builtin.set_fact:
@@ -289,37 +201,35 @@
       vars:
         endpoint_items: >-
           [{% for endpoint in prerequisites_network_endpoints %}
-          {{ {'section': 'NETWORK', 'name': endpoint.name | default(endpoint.host), 'status': ('PASS' if (prerequisites_endpoint_diagnostics.results[loop.index0].stdout | default('') | trim == 'OK') else 'FAIL'), 'detail': prerequisites_endpoint_diagnostics.results[loop.index0].stdout | default('check unavailable') | trim} | to_json }}{{ ',' if not loop.last else '' }}
+          {{ {'section': 'NETWORK', 'name': endpoint.name | default(endpoint.host), 'status': ('PASS' if prerequisites_endpoint_diagnostics.results[loop.index0].stdout | default('') | trim == 'OK' else 'FAIL'), 'actual': prerequisites_endpoint_diagnostics.results[loop.index0].stdout | default('check unavailable') | trim, 'required': 'Configured endpoint reachable', 'explanation': ('' if prerequisites_endpoint_diagnostics.results[loop.index0].stdout | default('') | trim == 'OK' else 'Verify DNS, TCP, or TLS connectivity.'), 'owner': 'Infrastructure'} | to_json }}{{ ',' if not loop.last else '' }}
           {% endfor %}]
       when: prerequisites_network_endpoints | length > 0
 
     - name: Display per-host validation report
       ansible.builtin.debug:
         msg: |
-          RKE2 INFRASTRUCTURE VALIDATION
-          ==========================================
-          Host: {{ inventory_hostname }}
-          Role: {{ prerequisites_role }}
-          OS:   {{ ansible_facts.distribution | default('Unknown') }} {{ ansible_facts.distribution_version | default('unknown') }}
+          RKE2 PREREQUISITES — {{ ansible_facts.hostname | default(inventory_hostname) }}
+          Inventory: {{ inventory_hostname }}
+          Role: {{ prerequisites_role }} | OS: {{ ansible_facts.distribution | default('Unknown') }} {{ ansible_facts.distribution_version | default('unknown') }}
 
-          {% for section in ['SYSTEM', 'NETWORK', 'KUBERNETES', 'STORAGE'] %}
+          {% for section in ['SYSTEM', 'STORAGE', 'NETWORK', 'KUBERNETES'] %}
           {{ section }}
-          ------------------------------------------
-          {% for result in prerequisites_results if result.section == section %}[{{ result.status }}] {{ result.name }}: {{ result.detail }}
+          ------------------------------------------------------------------------
+          Check                        Status  Actual                             Required
+          {% for result in prerequisites_results if result.section == section %}{{ '%-28s %-7s %-34s %s' | format(result.name, result.status, result.actual | default(''), result.required | default('')) }}
           {% endfor %}
           {% endfor %}
-
+          ACTION REQUIRED
+          ------------------------------------------------------------------------
+          {% for result in prerequisites_results if result.status in ['WARN', 'FAIL'] %}[{{ result.status }}] {{ result.name }} — Owner: {{ result.owner | default('Validation') }}
+             {{ result.explanation | default('Review this diagnostic.') }}
+          {% endfor %}
           SUMMARY
-          ------------------------------------------
-          PASS: {{ prerequisites_results | selectattr('status', 'equalto', 'PASS') | list | length }}
-          WARN: {{ prerequisites_results | selectattr('status', 'equalto', 'WARN') | list | length }}
-          FAIL: {{ prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length }}
-          SKIP: {{ prerequisites_results | selectattr('status', 'equalto', 'SKIP') | list | length }}
-
-          Overall: {{ 'NOT READY' if (prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0) else ('READY WITH WARNINGS' if (prerequisites_results | selectattr('status', 'equalto', 'WARN') | list | length > 0) else 'READY') }}
+          ------------------------------------------------------------------------
+          PASS: {{ prerequisites_results | selectattr('status', 'equalto', 'PASS') | list | length }} | WARN: {{ prerequisites_results | selectattr('status', 'equalto', 'WARN') | list | length }} | FAIL: {{ prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length }} | SKIP: {{ prerequisites_results | selectattr('status', 'equalto', 'SKIP') | list | length }}
+          Overall: {{ 'NOT READY' if prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0 else ('READY WITH WARNINGS' if prerequisites_results | selectattr('status', 'equalto', 'WARN') | list | length > 0 else 'READY') }}
 
     - name: Mark mandatory validation failures after report generation
       ansible.builtin.fail:
         msg: "Mandatory RKE2 infrastructure prerequisites failed on {{ inventory_hostname }}. See the report above."
-      when: >-
-        prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0
+      when: prerequisites_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0

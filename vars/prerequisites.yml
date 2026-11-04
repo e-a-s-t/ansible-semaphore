@@ -1,5 +1,6 @@
 ---
-# All capacities use decimal bytes, matching lsblk --bytes output.
+# Disk capacities use decimal GB, matching lsblk --bytes output.
+# Memory capacities use binary GiB because Linux reports memory in MiB.
 prerequisites_requirements:
   control_plane:
     vcpu: 4
@@ -17,8 +18,9 @@ prerequisites_requirements:
     os_disk_gb: 100
     data_disk_gb: 2000
 
-# A VM can report slightly less usable memory than its provisioned value.
-# A value of 0.05 permits up to 5% below the nominal requirement.
+# Linux-visible memory can be slightly lower than provisioned VM memory because
+# the kernel and firmware reserve memory. A value of 0.05 permits up to 5%
+# below the nominal requirement. This does not verify the hypervisor value.
 prerequisites_memory_tolerance: 0.05
 
 # Set this per host or role group when automatic identification is not certain.

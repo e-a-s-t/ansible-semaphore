@@ -47,7 +47,7 @@ Do not add passwords or private keys to the inventory or any other tracked file.
 
 The validation supports Ubuntu 24.04 and Debian 13. Other Linux distributions receive a warning. It checks operating-system facts, x86_64 architecture, CPU, memory, root storage, networking, time synchronization, swap, kernel modules and parameters, firewall utilities, existing Kubernetes/RKE2 processes, Longhorn-related worker dependencies, and explicitly configured endpoints.
 
-Requirements are configured in `vars/prerequisites.yml`. Memory uses a configurable tolerance because usable guest memory can be slightly below provisioned VM memory.
+Requirements are configured in `vars/prerequisites.yml`. Disk requirements use decimal `GB`; Linux memory is displayed in binary `GiB`. Memory uses a configurable tolerance because Linux-visible memory can be slightly below provisioned VM memory due to kernel and firmware reservations. The playbook does not claim that provisioned memory was verified unless an independent source provides it.
 
 Dedicated worker or backup disks must be explicitly identified, for example with a host or group variable:
 
@@ -55,7 +55,7 @@ Dedicated worker or backup disks must be explicitly identified, for example with
 prerequisites_data_disk_device: /dev/sdb
 ```
 
-The playbook never assumes an unmounted disk is safe, and never partitions, formats, mounts, installs, configures, or restarts anything. Disk discovery reports block devices, filesystems, mount points, provisioned capacity, and filesystem capacity. A confirmed missing or undersized required disk is FAIL; an ambiguous disk identity is WARN.
+The playbook never assumes an unmounted disk is safe, and never partitions, formats, mounts, installs, configures, or restarts anything. Disk discovery reports block devices, filesystems, mount points, provisioned parent-disk capacity, root-device capacity, root-filesystem capacity, and available filesystem capacity. The OS-disk requirement is evaluated only against a confidently identified underlying disk. A confirmed missing or undersized required disk is FAIL; an ambiguous disk identity is WARN.
 
 Network endpoint checks are disabled by default. Add only explicitly approved endpoints to `prerequisites_network_endpoints` in inventory or variables. Checks distinguish DNS, TCP, and optional TLS connectivity. Successful TCP or TLS connectivity does not prove application authorization or API-level access. No public service is tested implicitly.
 
