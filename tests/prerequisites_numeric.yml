@@ -114,3 +114,46 @@
           - "'stdout' not in report_fixture"
           - "'invocation' not in report_fixture"
           - "'{' not in report_fixture"
+
+    - name: Model callback-safe report and bounded table values
+      ansible.builtin.set_fact:
+        report_lines:
+          - "SYSTEM"
+          - "Memory                       PASS    7.75 GiB visible to Linux          8 GiB provisioned"
+          - ""
+          - "BLOCK DEVICES"
+          - "/dev/sda     disk    53.69 GB   -           -"
+        long_actual: "default via 192.168.50.165 dev ens18 proto dhcp src 192.168.50.165 metric 100"
+        raw_block_devices: "└─/dev/sda1 part 52.61 GB ext4 /"
+
+    - name: Derive callback-safe report values
+      ansible.builtin.set_fact:
+        report_text: "{{ report_lines | join('\n') }}"
+        bounded_actual: "{{ long_actual | truncate(34, true, '...') }}"
+        normalized_block_devices: "{{ raw_block_devices | replace('└─', '') | replace('├─', '') }}"
+
+    - name: Simulate report-before-failure control flow
+      block:
+        - name: Mark report as emitted
+          ansible.builtin.set_fact:
+            report_generated: true
+        - name: Simulate mandatory failure
+          ansible.builtin.fail:
+            msg: simulated mandatory prerequisite failure
+      rescue:
+        - name: Mark failure as observed after report
+          ansible.builtin.set_fact:
+            mandatory_failure: true
+
+    - name: Assert callback-safe report behavior and failure ordering
+      ansible.builtin.assert:
+        that:
+          - "'\\\\n' not in report_text"
+          - "'SYSTEM\n' in report_text"
+          - "'BLOCK DEVICES\n' in report_text"
+          - "'└─' not in normalized_block_devices"
+          - "normalized_block_devices.startswith('/dev/sda1')"
+          - "bounded_actual | length <= 34"
+          - "bounded_actual.endswith('...')"
+          - report_generated
+          - mandatory_failure

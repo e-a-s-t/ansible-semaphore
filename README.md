@@ -22,6 +22,7 @@ ansible-semaphore/
 ## Prerequisites
 
 - Ansible installed locally, or Ansible Semaphore configured to run Ansible.
+- The `ansible.posix` collection available in the execution environment; its debug stdout callback is configured to preserve multiline report formatting.
 - A Linux target VM in Proxmox2.
 - An SSH user on the target VM. The user does not need sudo or root privileges.
 - A separate SSH key for GitHub repository access and target VM access.

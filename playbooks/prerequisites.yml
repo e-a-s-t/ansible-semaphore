@@ -37,39 +37,50 @@
 
   tasks:
     - name: Collect read-only diagnostic data
-      ansible.builtin.shell: "{{ item.command }}"
-      loop:
-        - { key: hostname_fqdn, command: "hostname --fqdn" }
-        - { key: python3, command: "command -v python3" }
-        - { key: block_devices, command: "lsblk -rpnbo NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS | awk '{printf \"%s | %s | %.2f GB | %s | %s\\n\", $1, $2, $3/1000000000, $4, ($5 == \"\" ? \"-\" : $5)}'" }
-        - { key: root_source, command: "findmnt -n -o SOURCE /" }
-        - { key: root_partition_size, command: "findmnt -n -o SOURCE / | xargs -r lsblk -bno SIZE" }
-        - { key: root_disk, command: "findmnt -n -o SOURCE / | xargs -r lsblk -s -b -n -o NAME,TYPE,SIZE | awk '$2 == \"disk\" {line=$0} END {print line}'" }
-        - { key: root_filesystem_size, command: "df -B1 --output=size / | tail -n 1 | tr -d '[:space:]'" }
-        - { key: root_filesystem_available, command: "df -B1 --output=avail / | tail -n 1 | tr -d '[:space:]'" }
-        - { key: hostname_resolution, command: "getent ahostsv4 $(hostname --fqdn) | awk '{print $1}' | sort -u" }
-        - { key: ipv4, command: "ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1" }
-        - { key: default_route, command: "ip route show default" }
-        - { key: resolv_conf, command: "awk '/^[[:space:]]*nameserver[[:space:]]/ {print $2}' /etc/resolv.conf" }
-        - { key: swap, command: "cat /proc/swaps" }
-        - { key: modules, command: "lsmod" }
-        - { key: ip_forward, command: "sysctl -n net.ipv4.ip_forward" }
-        - { key: bridge_iptables, command: "sysctl -n net.bridge.bridge-nf-call-iptables" }
-        - { key: iptables, command: "command -v iptables" }
-        - { key: nft, command: "command -v nft" }
-        - { key: iscsiadm, command: "command -v iscsiadm" }
-        - { key: systemd_time_ntp, command: "timedatectl show --property=NTP --value" }
-        - { key: systemd_time_sync, command: "timedatectl show --property=NTPSynchronized --value" }
-        - { key: chrony, command: "command -v chronyc" }
-        - { key: chrony_tracking, command: "chronyc tracking" }
-        - { key: timesyncd, command: "systemctl is-enabled systemd-timesyncd" }
-        - { key: kubernetes_processes, command: "ps -eo pid,args | grep -E '[r]ke2|[k]ubelet|[k]3s'" }
+      ansible.builtin.shell: |
+        set +e
+        run_diag() {
+          diag_key="$1"
+          diag_command="$2"
+          diag_output=$(eval "$diag_command" 2>/dev/null)
+          diag_rc=$?
+          diag_encoded=$(printf '%s' "$diag_output" | base64 | tr -d '\n')
+          printf '%s\t%s\t%s\n' "$diag_key" "$diag_rc" "$diag_encoded"
+        }
+        {% for diagnostic in prerequisites_diagnostic_commands %}
+        run_diag {{ diagnostic.key | quote }} {{ diagnostic.command | quote }}
+        {% endfor %}
+      vars:
+        prerequisites_diagnostic_commands:
+          - { key: hostname_fqdn, command: "hostname --fqdn" }
+          - { key: python3, command: "command -v python3" }
+          - { key: block_devices, command: "lsblk -rpnbo NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS | awk '{printf \"%s | %s | %.2f GB | %s | %s\\n\", $1, $2, $3/1000000000, $4, ($5 == \"\" ? \"-\" : $5)}'" }
+          - { key: root_source, command: "findmnt -n -o SOURCE /" }
+          - { key: root_partition_size, command: "findmnt -n -o SOURCE / | xargs -r lsblk -bno SIZE" }
+          - { key: root_disk, command: "findmnt -n -o SOURCE / | xargs -r lsblk -s -b -n -o NAME,TYPE,SIZE | awk '$2 == \"disk\" {line=$0} END {print line}'" }
+          - { key: root_filesystem_size, command: "df -B1 --output=size / | tail -n 1 | tr -d '[:space:]'" }
+          - { key: root_filesystem_available, command: "df -B1 --output=avail / | tail -n 1 | tr -d '[:space:]'" }
+          - { key: hostname_resolution, command: "getent ahostsv4 $(hostname --fqdn) | awk '{print $1}' | sort -u" }
+          - { key: ipv4, command: "ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1" }
+          - { key: default_route, command: "ip route show default" }
+          - { key: resolv_conf, command: "awk '/^[[:space:]]*nameserver[[:space:]]/ {print $2}' /etc/resolv.conf" }
+          - { key: swap, command: "cat /proc/swaps" }
+          - { key: modules, command: "lsmod" }
+          - { key: ip_forward, command: "sysctl -n net.ipv4.ip_forward" }
+          - { key: bridge_iptables, command: "sysctl -n net.bridge.bridge-nf-call-iptables" }
+          - { key: iptables, command: "command -v iptables" }
+          - { key: nft, command: "command -v nft" }
+          - { key: iscsiadm, command: "command -v iscsiadm" }
+          - { key: systemd_time_ntp, command: "timedatectl show --property=NTP --value" }
+          - { key: systemd_time_sync, command: "timedatectl show --property=NTPSynchronized --value" }
+          - { key: chrony, command: "command -v chronyc" }
+          - { key: chrony_tracking, command: "chronyc tracking" }
+          - { key: timesyncd, command: "systemctl is-enabled systemd-timesyncd" }
+          - { key: kubernetes_processes, command: "ps -eo pid,args | grep -E '[r]ke2|[k]ubelet|[k]3s'" }
       register: prerequisites_diagnostics
       changed_when: false
       failed_when: false
       no_log: true
-      loop_control:
-        label: "{{ item.key }}"
 
     - name: Inspect the explicitly configured dedicated data disk
       ansible.builtin.shell: "lsblk -bno SIZE {{ prerequisites_data_disk_device | quote }}"
@@ -99,11 +110,22 @@
 
     - name: Convert diagnostic output to an internal lookup
       ansible.builtin.set_fact:
-        prerequisites_diag: "{{ prerequisites_diag | default({}) | combine({item.item.key: {'stdout': item.stdout | default(''), 'stdout_lines': item.stdout_lines | default([]), 'rc': item.rc | default(1)}}) }}"
-      loop: "{{ prerequisites_diagnostics.results }}"
+        prerequisites_diag_json: >-
+          {% set diag = {} %}
+          {% for line in prerequisites_diagnostics.stdout_lines | default([]) %}
+          {% set fields = line.split('\t', 2) %}
+          {% if fields | length == 3 %}
+          {% set decoded = fields[2] | b64decode %}
+          {% set _ = diag.update({fields[0]: {'stdout': decoded, 'stdout_lines': decoded.splitlines(), 'rc': fields[1] | int}}) %}
+          {% endif %}
+          {% endfor %}
+          {{ diag | to_json }}
       no_log: true
-      loop_control:
-        label: "{{ item.item.key }}"
+
+    - name: Parse diagnostic lookup
+      ansible.builtin.set_fact:
+        prerequisites_diag: "{{ prerequisites_diag_json | from_json }}"
+      no_log: true
 
     - name: Normalize diagnostic values
       ansible.builtin.set_fact:
@@ -111,7 +133,7 @@
         prerequisites_root_partition_raw: "{{ prerequisites_diag.get('root_partition_size', {}).get('stdout', '') | string | trim }}"
         prerequisites_root_filesystem_raw: "{{ prerequisites_diag.get('root_filesystem_size', {}).get('stdout', '') | string | trim }}"
         prerequisites_root_available_raw: "{{ prerequisites_diag.get('root_filesystem_available', {}).get('stdout', '') | string | trim }}"
-        prerequisites_root_disk_valid: "{{ (prerequisites_diag.get('root_disk', {}).get('stdout', '') | string | trim) is match('^[^|]+[[:space:]]+disk[[:space:]]+[0-9]+') }}"
+        prerequisites_root_disk_valid: "{{ (prerequisites_diag.get('root_disk', {}).get('stdout', '') | string | trim) is match('^[^|]+\\s+disk\\s+[0-9]+') }}"
         prerequisites_root_partition_valid: "{{ (prerequisites_diag.get('root_partition_size', {}).get('stdout', '') | string | trim) is match('^[0-9]+$') }}"
         prerequisites_root_filesystem_valid: "{{ (prerequisites_diag.get('root_filesystem_size', {}).get('stdout', '') | string | trim) is match('^[0-9]+$') }}"
         prerequisites_root_available_valid: "{{ (prerequisites_diag.get('root_filesystem_available', {}).get('stdout', '') | string | trim) is match('^[0-9]+$') }}"
@@ -146,8 +168,7 @@
         storage_items:
           - { section: STORAGE, name: OS disk, status: "{{ 'PASS' if disk_valid and disk_size | int >= req.get('os_disk_gb', 0) | int * 1000000000 else ('FAIL' if disk_valid else 'WARN') }}", actual: "{{ ((disk_size | int) / 1000000000) | round(2) }} GB provisioned on {{ disk_name if disk_valid else 'unknown disk' }}", required: "{{ req.get('os_disk_gb', 'unknown') }} GB provisioned", explanation: "{{ '' if disk_valid and disk_size | int >= req.get('os_disk_gb', 0) | int * 1000000000 else ('Increase the provisioned OS disk.' if disk_valid else 'Underlying disk cannot be identified reliably; verify VM storage. An unmounted disk is not inferred safe.') }}", owner: Infrastructure }
           - { section: STORAGE, name: Root partition/device, status: "{{ 'PASS' if prerequisites_root_partition_valid else 'WARN' }}", actual: "{{ (((prerequisites_root_partition_raw | int) / 1000000000) | round(2) ~ ' GB') if prerequisites_root_partition_valid else 'unknown' }}", required: Root device present, explanation: "Root partition or logical-volume size is unavailable.", owner: Validation }
-          - { section: STORAGE, name: Root filesystem, status: "{{ 'PASS' if prerequisites_root_filesystem_valid and prerequisites_root_available_valid else 'WARN' }}", actual: "{{ (((prerequisites_root_filesystem_raw | int) / 1000000000) | round(2) ~ ' GB capacity; ' ~ ((prerequisites_root_available_raw | int) / 1000000000) | round(2) ~ ' GB available') if prerequisites_root_filesystem_valid and prerequisites_root_available_valid else 'unknown' }}", required: Mounted filesystem available, explanation: "Root filesystem capacity or available space is unavailable.", owner: Validation }
-          - { section: STORAGE, name: Block devices, status: PASS, actual: "{{ prerequisites_diag.get('block_devices', {}).get('stdout', 'unavailable') | trim }}", required: "device | type | size | filesystem | mount", explanation: "", owner: Validation }
+          - { section: STORAGE, name: Root filesystem, status: "{{ 'PASS' if prerequisites_root_filesystem_valid and prerequisites_root_available_valid else 'WARN' }}", actual: "{{ (((prerequisites_root_filesystem_raw | int) / 1000000000) | round(2) ~ ' GB cap / ' ~ ((prerequisites_root_available_raw | int) / 1000000000) | round(2) ~ ' GB free') if prerequisites_root_filesystem_valid and prerequisites_root_available_valid else 'unknown' }}", required: Mounted filesystem available, explanation: "Root filesystem capacity or available space is unavailable.", owner: Validation }
           - { section: STORAGE, name: Dedicated role data disk, status: "{{ 'SKIP' if prerequisites_role not in ['worker', 'backup'] else ('WARN' if prerequisites_data_disk_device | default('') | trim == '' or not data_valid else ('PASS' if data_raw | int >= req.get('data_disk_gb', 0) | int * 1000000000 else 'FAIL')) }}", actual: "{{ 'Not required' if prerequisites_role not in ['worker', 'backup'] else (prerequisites_data_disk_device if prerequisites_data_disk_device | default('') | trim == '' else (((data_raw | int) / 1000000000) | round(2) ~ ' GB on ' ~ prerequisites_data_disk_device)) }}", required: "{{ req.get('data_disk_gb', 'unknown') }} GB on explicit device", explanation: "{{ 'Configure an explicit dedicated disk; an unmounted disk is not inferred safe.' if prerequisites_role in ['worker', 'backup'] and (prerequisites_data_disk_device | default('') | trim == '' or not data_valid) else ('Increase the configured dedicated data disk.' if prerequisites_role in ['worker', 'backup'] and data_valid and data_raw | int < req.get('data_disk_gb', 0) | int * 1000000000 else '') }}", owner: Infrastructure }
 
     - name: Validate networking
@@ -159,9 +180,9 @@
         has_global: "{{ resolved.splitlines() | select('in', addresses.split() | list) | list | length > 0 }}"
         loopback_only: "{{ resolved and resolved.splitlines() | reject('match', '^127\\.') | list | length == 0 }}"
         network_items:
-          - { section: NETWORK, name: IPv4 address, status: "{{ 'PASS' if addresses else 'FAIL' }}", actual: "{{ addresses if addresses else 'none' }}", required: Global IPv4 address, explanation: "Assign a routable IPv4 address.", owner: Infrastructure }
-          - { section: NETWORK, name: Default route, status: "{{ 'PASS' if prerequisites_diag.get('default_route', {}).get('stdout', '') | trim else 'FAIL' }}", actual: "{{ prerequisites_diag.get('default_route', {}).get('stdout', 'none') | trim }}", required: Default route, explanation: "Configure a default route.", owner: Infrastructure }
-          - { section: NETWORK, name: Hostname resolution, status: "{{ 'PASS' if has_global else 'WARN' }}", actual: "{{ resolved if resolved else 'unavailable' }}", required: Hostname resolves to node IP, explanation: "{{ '' if has_global else ('Hostname resolves only to loopback; map it to the routable node address.' if loopback_only else 'Hostname does not resolve to a routable node address.') }}", owner: Infrastructure }
+          - { section: NETWORK, name: IPv4 address, status: "{{ 'PASS' if addresses else 'FAIL' }}", actual: "{{ addresses.splitlines() | first if addresses else 'none' }}", required: Global IPv4 address, explanation: "{{ '' if addresses else 'Assign a routable IPv4 address.' }}", owner: Infrastructure }
+          - { section: NETWORK, name: Default route, status: "{{ 'PASS' if prerequisites_diag.get('default_route', {}).get('stdout', '') | trim else 'FAIL' }}", actual: "{{ 'Configured' if prerequisites_diag.get('default_route', {}).get('stdout', '') | trim else 'Unavailable' }}", required: Default route, explanation: "{{ '' if prerequisites_diag.get('default_route', {}).get('stdout', '') | trim else 'Configure a default route.' }}", owner: Infrastructure }
+          - { section: NETWORK, name: Hostname resolution, status: "{{ 'PASS' if has_global else 'WARN' }}", actual: "{{ resolved.splitlines() | first if resolved else 'unavailable' }}", required: Hostname resolves to node IP, explanation: "{{ '' if has_global else ('Hostname resolves only to loopback; map it to the routable node address.' if loopback_only else 'Hostname does not resolve to a routable node address.') }}", owner: Infrastructure }
           - { section: NETWORK, name: DNS resolvers, status: "{{ 'PASS' if prerequisites_diag.get('resolv_conf', {}).get('stdout', '') | trim else 'WARN' }}", actual: "{{ prerequisites_diag.get('resolv_conf', {}).get('stdout', 'none') | trim }}", required: Configured resolvers, explanation: "Configure DNS resolvers.", owner: Infrastructure }
 
     - name: Validate time synchronization
@@ -216,8 +237,15 @@
           {{ section }}
           ------------------------------------------------------------------------
           Check                        Status  Actual                             Required
-          {% for result in prerequisites_results if result.section == section %}{{ '%-28s %-7s %-34s %s' | format(result.name, result.status, result.actual | default(''), result.required | default('')) }}
+          {% for result in prerequisites_results if result.section == section %}{{ '%-28s %-7s %-34s %s' | format(result.name | truncate(28, true, '...'), result.status, (result.actual | default('') | replace('\n', ' ') | replace('\r', ' ') | truncate(34, true, '...')), (result.required | default('') | replace('\n', ' ') | replace('\r', ' ') | truncate(24, true, '...'))) }}
           {% endfor %}
+          {% if section == 'STORAGE' %}
+          BLOCK DEVICES
+          --------------------------------------------------
+          Device       Type    Size       Filesystem  Mount
+          --------------------------------------------------
+          {{ prerequisites_diag.get('block_devices', {}).get('stdout', 'unavailable') | replace('└─', '') | replace('├─', '') | trim }}
+          {% endif %}
           {% endfor %}
           ACTION REQUIRED
           ------------------------------------------------------------------------
