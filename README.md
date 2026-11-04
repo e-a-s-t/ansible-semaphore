@@ -54,13 +54,13 @@ Requirements are mapped to the [RKE2 requirements](https://docs.rke2.io/install/
 
 Requirements are configured in `vars/prerequisites.yml`. Disk requirements use decimal `GB`; Linux memory is displayed in binary `GiB`. Memory uses a configurable tolerance because Linux-visible memory can be slightly below provisioned VM memory due to kernel and firmware reservations. The playbook does not claim that provisioned memory was verified unless an independent source provides it.
 
-Dedicated worker or backup disks must be explicitly identified, for example with a host or group variable:
+Worker Longhorn storage is discovered automatically from read-only block-device and mount diagnostics. An explicit device may still be supplied with a host or group variable when discovery finds multiple suitable disks:
 
 ```yaml
-prerequisites_data_disk_device: /dev/sdb
+prerequisites_data_disk_device: /dev/vdc
 ```
 
-The playbook never assumes an unmounted disk is safe, and never partitions, formats, mounts, installs, configures, or restarts anything. Disk discovery reports block devices, filesystems, mount points, provisioned parent-disk capacity, root-device capacity, root-filesystem capacity, and available filesystem capacity. The OS-disk requirement is evaluated only against a confidently identified underlying disk. A confirmed missing or undersized required disk is FAIL; an ambiguous disk identity is WARN.
+The playbook never assumes an unmounted disk is safe, and never partitions, formats, mounts, installs, configures, or restarts anything. It first validates an existing `/var/lib/longhorn` mount, including its underlying storage, filesystem, capacity, available space, and persistent mount configuration. If the path is not mounted, it excludes the OS disk, partitions, mounted devices, swap, LVM, RAID, and devices with existing filesystems or partitions before evaluating unused disks. Exactly one suitable disk passes; multiple suitable disks are reported as incomplete and require an explicit override; if all discovered unused disks are undersized, the result is FAIL with their capacities. The OS-disk requirement is evaluated only against a confidently identified underlying disk.
 
 Network endpoint checks are disabled by default. Add only explicitly approved endpoints to `prerequisites_network_endpoints` in inventory or variables. Checks distinguish DNS, TCP, and optional TLS connectivity. Successful TCP or TLS connectivity does not prove application authorization or API-level access. No public service is tested implicitly.
 

@@ -35,8 +35,9 @@ rke2_clean_install_policy: false
 # below the nominal requirement. This does not verify the hypervisor value.
 prerequisites_memory_tolerance: 0.05
 
-# Set this per host or role group when automatic identification is not certain.
-# Example: prerequisites_data_disk_device: /dev/sdb
+# Optional explicit worker/backup disk override. Workers discover suitable
+# unused disks automatically when this is empty.
+# Example: prerequisites_data_disk_device: /dev/vdc
 prerequisites_data_disk_device: ""
 
 # Only explicitly configured endpoints are tested. Each item may contain:

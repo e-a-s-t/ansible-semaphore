@@ -361,6 +361,71 @@
           - (longhorn_disk_cases | selectattr('name', 'equalto', 'worker-formatted-mounted') | map(attribute='status') | first) == 'PASS'
           - (longhorn_disk_cases | selectattr('name', 'equalto', 'backup-valid') | map(attribute='status') | first) == 'PASS'
 
+    - name: Model automatic Longhorn mount and discovery states
+      ansible.builtin.set_fact:
+        longhorn_automatic_cases:
+          - { name: mounted-dedicated-partition, status: PASS, incomplete: false, actual: "/dev/sdb1 ext4 600 GB total 500 GB available persistent=yes" }
+          - { name: mounted-os-partition, status: FAIL, incomplete: false, actual: "/dev/sda2 ext4 600 GB total 500 GB available persistent=yes" }
+          - { name: mounted-bind-from-os, status: FAIL, incomplete: false, actual: "bind source /var/lib/other" }
+          - { name: mounted-unsupported-filesystem, status: FAIL, incomplete: false, actual: "/dev/sdb1 btrfs 600 GB total 500 GB available persistent=yes" }
+          - { name: mounted-without-persistence, status: FAIL, incomplete: false, actual: "/dev/sdb1 ext4 600 GB total 500 GB available persistent=no" }
+          - { name: mounted-missing-available-space, status: WARN, incomplete: true, actual: "/dev/sdb1 ext4 600 GB total available=unknown" }
+          - { name: one-suitable-unused-disk, status: PASS, incomplete: false, actual: "suitable=/dev/sdb:600 GB" }
+          - { name: multiple-suitable-unused-disks, status: WARN, incomplete: true, actual: "suitable=/dev/sdb:600 GB, /dev/sdc:700 GB" }
+          - { name: all-unused-disks-undersized, status: FAIL, incomplete: false, actual: "undersized=/dev/sdb:400 GB, /dev/sdc:450 GB" }
+          - { name: discovery-identity-unknown, status: WARN, incomplete: true, actual: "Automatic disk discovery evidence is incomplete." }
+          - { name: explicit-override, status: PASS, incomplete: false, actual: "Override /dev/vdc, 600 GB" }
+
+    - name: Assert automatic Longhorn mount and discovery classifications
+      ansible.builtin.assert:
+        that:
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'mounted-dedicated-partition') | map(attribute='status') | first) == 'PASS'
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'mounted-os-partition') | map(attribute='status') | first) == 'FAIL'
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'mounted-bind-from-os') | map(attribute='status') | first) == 'FAIL'
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'mounted-unsupported-filesystem') | map(attribute='status') | first) == 'FAIL'
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'mounted-without-persistence') | map(attribute='status') | first) == 'FAIL'
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'mounted-missing-available-space') | map(attribute='incomplete') | first | bool)
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'one-suitable-unused-disk') | map(attribute='status') | first) == 'PASS'
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'multiple-suitable-unused-disks') | map(attribute='status') | first) == 'WARN'
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'multiple-suitable-unused-disks') | map(attribute='incomplete') | first | bool)
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'all-unused-disks-undersized') | map(attribute='status') | first) == 'FAIL'
+          - "'400 GB' in (longhorn_automatic_cases | selectattr('name', 'equalto', 'all-unused-disks-undersized') | map(attribute='actual') | first)"
+          - "'450 GB' in (longhorn_automatic_cases | selectattr('name', 'equalto', 'all-unused-disks-undersized') | map(attribute='actual') | first)"
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'discovery-identity-unknown') | map(attribute='incomplete') | first | bool)
+          - (longhorn_automatic_cases | selectattr('name', 'equalto', 'explicit-override') | map(attribute='status') | first) == 'PASS'
+
+    - name: Model Longhorn candidate exclusions
+      ansible.builtin.set_fact:
+        longhorn_excluded_devices:
+          - { device: /dev/sda, reason: os-disk }
+          - { device: /dev/sdb, reason: mounted }
+          - { device: /dev/sdc, reason: swap }
+          - { device: /dev/sdd, reason: lvm }
+          - { device: /dev/sde, reason: raid }
+          - { device: /dev/sdf, reason: existing-filesystem }
+          - { device: /dev/sdg, reason: partitions-or-mapped-children }
+
+    - name: Assert Longhorn candidate exclusions are reported
+      ansible.builtin.assert:
+        that:
+          - longhorn_excluded_devices | map(attribute='reason') | list | difference(['os-disk', 'mounted', 'swap', 'lvm', 'raid', 'existing-filesystem', 'partitions-or-mapped-children']) | length == 0
+          - longhorn_excluded_devices | length == 7
+
+    - name: Model memory remediation messages
+      ansible.builtin.set_fact:
+        memory_remediation_cases:
+          - { name: pass, status: PASS, explanation: "" }
+          - { name: below-tolerance, status: FAIL, explanation: "Increase visible memory; it is below the tolerated minimum." }
+          - { name: unavailable, status: WARN, explanation: "Linux-visible memory evidence is unavailable or malformed." }
+
+    - name: Assert memory remediation matches status
+      ansible.builtin.assert:
+        that:
+          - (memory_remediation_cases | selectattr('name', 'equalto', 'pass') | map(attribute='explanation') | first) == ''
+          - "'below the tolerated minimum' in (memory_remediation_cases | selectattr('name', 'equalto', 'below-tolerance') | map(attribute='explanation') | first)"
+          - "'Within tolerance' not in (memory_remediation_cases | selectattr('name', 'equalto', 'below-tolerance') | map(attribute='explanation') | first)"
+          - "'unavailable or malformed' in (memory_remediation_cases | selectattr('name', 'equalto', 'unavailable') | map(attribute='explanation') | first)"
+
     - name: Model verified versus unverified readiness evidence
       ansible.builtin.set_fact:
         verified_warning:
