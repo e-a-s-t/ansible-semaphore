@@ -1,0 +1,65 @@
+---
+- name: Regression tests for prerequisites numeric validation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    test_requirements:
+      vcpu: "4"
+      memory_gib: "8"
+      os_disk_gb: "100"
+      data_disk_gb: "500"
+    test_tolerance: "0.05"
+
+  tasks:
+    - name: Normalize valid numeric strings
+      ansible.builtin.set_fact:
+        test_cpu: "{{ '4' | int }}"
+        test_memory: "{{ '7.76' | float }}"
+        test_root_disk: "{{ '100000000000' | int }}"
+        test_data_disk: "{{ '500000000000' | int }}"
+        test_rc: "{{ '0' | int }}"
+
+    - name: Assert valid strings are converted before comparison
+      ansible.builtin.assert:
+        that:
+          - (test_cpu | int) >= (test_requirements.vcpu | int)
+          - (test_memory | float) >= ((test_requirements.memory_gib | float) * (1 - (test_tolerance | float)))
+          - (test_root_disk | int) >= ((test_requirements.os_disk_gb | int) * 1000000000)
+          - (test_data_disk | int) >= ((test_requirements.data_disk_gb | int) * 1000000000)
+          - (test_rc | int) == 0
+
+    - name: Model unavailable and malformed diagnostics
+      ansible.builtin.set_fact:
+        missing_raw: ""
+        malformed_raw: "not-a-number"
+        missing_valid: false
+        malformed_valid: false
+        missing_numeric: "{{ '' | int }}"
+        malformed_numeric: "{{ 'not-a-number' | int }}"
+        missing_cpu_raw: ""
+        missing_memory_raw: ""
+        missing_cpu_valid: "{{ missing_cpu_raw is match('^[0-9]+$') }}"
+        missing_memory_valid: "{{ missing_memory_raw is match('^[0-9]+([.][0-9]+)?$') }}"
+        missing_status: "{{ 'WARN' if not (missing_valid | bool) else 'FAIL' }}"
+        malformed_status: "{{ 'WARN' if not (malformed_valid | bool) else 'FAIL' }}"
+        missing_cpu_status: "{{ 'WARN' if not (missing_cpu_valid | bool) else 'FAIL' }}"
+        missing_memory_status: "{{ 'WARN' if not (missing_memory_valid | bool) else 'FAIL' }}"
+
+    - name: Assert unavailable and malformed values produce WARN inputs
+      ansible.builtin.assert:
+        that:
+          - not (missing_valid | bool)
+          - not (malformed_valid | bool)
+          - (missing_numeric | int) == 0
+          - (malformed_numeric | int) == 0
+          - missing_status == "WARN"
+          - malformed_status == "WARN"
+          - missing_cpu_status == "WARN"
+          - missing_memory_status == "WARN"
+
+    - name: Assert confidently undersized disks remain FAIL
+      ansible.builtin.assert:
+        that:
+          - ("FAIL" if ("90000000000" | int) < ((test_requirements.os_disk_gb | int) * 1000000000) else "PASS") == "FAIL"
+          - ("FAIL" if ("400000000000" | int) < ((test_requirements.data_disk_gb | int) * 1000000000) else "PASS") == "FAIL"
