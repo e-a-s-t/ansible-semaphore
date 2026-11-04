@@ -40,28 +40,38 @@ prerequisites_memory_tolerance: 0.05
 # Example: prerequisites_data_disk_device: /dev/vdc
 prerequisites_data_disk_device: ""
 
-# Formatting an automatically selected worker disk is destructive and must be
-# explicitly authorized for the preparation playbook.
-# prerequisites_allow_disk_format: false
-
 # Shared read-only discovery command used by the validator and preparation
 # playbook. It deliberately emits tab-separated records for safe parsing.
 prerequisites_longhorn_disk_discovery_command: >-
-  root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | xargs -r lsblk -s -b -n -o NAME,TYPE,SIZE 2>/dev/null | awk '$2 == "disk" {print $1; exit}');
+  root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true);
+  root_disk=$(lsblk -s -rpnbo PATH,TYPE "$root_source" 2>/dev/null | awk '$2 == "disk" {print $1; exit}');
+  printf 'ROOT\t%s\n' "$root_disk";
   swap_devices=$(swapon --show=NAME --noheadings 2>/dev/null);
   lsblk -dnbo PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS 2>/dev/null | while read -r path type size fstype mountpoint; do
   [ "$type" = disk ] || continue;
   reason=;
-  child=$(lsblk -nrpbo NAME,TYPE,PKNAME "$path" 2>/dev/null | awk -v p="$path" '$1 != p {print; exit}');
+  identity=$(udevadm info --query=property --name "$path" 2>/dev/null | awk -F= '/^(ID_WWN|ID_SERIAL|ID_PATH)=/ {print $2; exit}' || true);
+  descendants=$(lsblk -nrpbo NAME,TYPE,MOUNTPOINTS "$path" 2>/dev/null || true);
+  child=$(printf '%s\n' "$descendants" | awk -v p="$path" '$1 != p {print; exit}');
   signature=$(blkid -p -o value -s TYPE "$path" 2>/dev/null || true);
-  if [ "$path" = "$root_disk" ]; then reason=os-disk;
+  consumer=$(printf '%s\n' "$descendants" | awk '$2 != "disk" || ($3 != "" && $3 != "-") {print; exit}');
+  swap_consumer=$(printf '%s\n' "$descendants" | awk -v swaps="$swap_devices" 'BEGIN {n=split(swaps,a,"\n"); for (i=1;i<=n;i++) s[a[i]]=1} $1 in s {print; exit}');
+  holder=$(basename "$path");
+  has_holder=$(find "/sys/class/block/$holder/holders" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true);
+  pv=$(command -v pvs >/dev/null && pvs --noheadings --select "pv_name=$path" -o pv_name 2>/dev/null | tr -d ' ' || true);
+  md=$(printf '%s\n' "$descendants" | awk '$2 ~ /^(md|raid)/ {print; exit}');
+  if [ -z "$root_disk" ]; then reason=root-disk-unknown;
+  elif [ "$path" = "$root_disk" ]; then reason=os-disk;
+  elif [ -z "$identity" ]; then reason=identity-unknown;
   elif [ -n "$child" ]; then reason=partitions-or-mapped-children;
-  elif [ "$mountpoint" != "-" ] && [ -n "$mountpoint" ]; then reason=mounted;
-  elif printf '%s\n' "$swap_devices" | awk -v p="$path" '$1 == p {found=1} END {exit !found}'; then reason=swap;
+  elif [ -n "$consumer" ] || [ "$mountpoint" != "-" ] && [ -n "$mountpoint" ]; then reason=mounted-or-consumer;
+  elif [ -n "$swap_consumer" ]; then reason=swap;
+  elif [ -n "$pv" ]; then reason=lvm;
+  elif [ -n "$md" ] || [ -n "$has_holder" ]; then reason=raid-or-holder;
   elif [ -n "$fstype" ] || [ -n "$signature" ]; then reason=existing-filesystem;
   fi;
-  if [ -n "$reason" ]; then printf 'REJECT\t%s\t%s\t%s\n' "$path" "$size" "$reason";
-  else printf 'UNUSED\t%s\t%s\n' "$path" "$size"; fi;
+  if [ -n "$reason" ]; then printf 'REJECT\t%s\t%s\t%s\t%s\n' "$path" "$size" "$reason" "$identity";
+  else printf 'UNUSED\t%s\t%s\t%s\n' "$path" "$size" "$identity"; fi;
   done
 
 # Only explicitly configured endpoints are tested. Each item may contain:

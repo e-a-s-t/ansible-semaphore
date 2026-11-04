@@ -13,7 +13,6 @@
         prerequisites_requirements:
           worker: { data_disk_gb: 20 }
         prerequisites_data_disk_device: ''
-        prerequisites_allow_disk_format: false
         prerequisites_longhorn_filesystems: [ext4, xfs]
         prepare_nodes_mount_inspection:
           stdout_lines:
@@ -22,7 +21,7 @@
         prepare_nodes_disk_discovery:
           stdout_lines:
             - "REJECT\t/dev/sda\t34360000000\tos-disk"
-            - "UNUSED\t/dev/sdb\t21470000000"
+            - "UNUSED\t/dev/sdb\t21470000000\twwn-sdb"
 
     - name: Run the actual storage normalization and selection task sequence
       ansible.builtin.include_tasks: ../tasks/longhorn-storage-state.yml
@@ -33,8 +32,8 @@
           - prepare_nodes_root_disk == '/dev/sda'
           - prepare_nodes_selected_device == '/dev/sdb'
           - prepare_nodes_selected_size | int == 21470000000
-          - prepare_nodes_storage_status == 'AUTHORIZATION_REQUIRED'
-          - not prepare_nodes_storage_authorized | bool
+          - prepare_nodes_storage_status == 'READY_TO_PREPARE'
+          - prepare_nodes_storage_authorized | bool
 
     - name: Execute the shared storage task sequence for all Task 17 states
       ansible.builtin.include_tasks: ../tasks/longhorn-storage-state.yml
@@ -43,7 +42,6 @@
         prerequisites_requirements:
           worker: { data_disk_gb: 20 }
         prerequisites_data_disk_device: "{{ storage_case.override }}"
-        prerequisites_allow_disk_format: "{{ storage_case.allow }}"
         prerequisites_longhorn_filesystems: [ext4, xfs]
         prepare_nodes_mount_inspection: "{{ storage_case.mount }}"
         prepare_nodes_disk_discovery: "{{ storage_case.discovery }}"
@@ -52,27 +50,42 @@
           allow: false
           override: ''
           mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
-          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk", "UNUSED\t/dev/sdb\t1000000000"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk\twwn-sda", "UNUSED\t/dev/sdb\t1000000000\twwn-sdb"] }
         - name: multiple-eligible-disks
           allow: false
           override: ''
           mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
-          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk", "UNUSED\t/dev/sdb\t21470000000", "UNUSED\t/dev/sdc\t30000000000"] }
-        - name: formatting-disabled
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk\twwn-sda", "UNUSED\t/dev/sdb\t21470000000\twwn-sdb", "UNUSED\t/dev/sdc\t30000000000\twwn-sdc"] }
+        - name: explicit-safe-override
+          allow: false
+          override: /dev/sdc
+          mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk\twwn-sda", "UNUSED\t/dev/sdb\t21470000000\twwn-sdb", "UNUSED\t/dev/sdc\t30000000000\twwn-sdc"] }
+        - name: automatic-formatting
           allow: false
           override: ''
           mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
-          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk", "UNUSED\t/dev/sdb\t21470000000"] }
-        - name: formatting-enabled
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk\twwn-sda", "UNUSED\t/dev/sdb\t21470000000\twwn-sdb"] }
+        - name: automatic-formatting-repeat
           allow: true
           override: ''
           mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
-          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk", "UNUSED\t/dev/sdb\t21470000000"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk\twwn-sda", "UNUSED\t/dev/sdb\t21470000000\twwn-sdb"] }
         - name: existing-valid-mount
           allow: false
           override: ''
-          mount: { stdout_lines: ["MOUNT\t/dev/sdb\text4\tdefaults\t/dev/sdb\t21470000000\tuuid-sdb", "ROOT\t/dev/sda"] }
+          mount: { stdout_lines: ["MOUNT\t/dev/sdb\text4\tdefaults\t/dev/sdb\t21470000000\tuuid-sdb\tUUID=uuid-sdb", "ROOT\t/dev/sda"] }
           discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk"] }
+        - name: existing-filesystem
+          allow: false
+          override: ''
+          mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk\twwn-sda", "REJECT\t/dev/sdb\t21470000000\texisting-filesystem\twwn-sdb"] }
+        - name: identity-unknown
+          allow: false
+          override: ''
+          mount: { stdout_lines: ["MOUNT\t\t\t\t\t\t", "ROOT\t/dev/sda"] }
+          discovery: { stdout_lines: ["REJECT\t/dev/sda\t34360000000\tos-disk\twwn-sda", "REJECT\t/dev/sdb\t21470000000\tidentity-unknown"] }
       loop_control:
         loop_var: storage_case
 
@@ -81,11 +94,14 @@
         that:
           - (task_sequence_results | selectattr('name', 'equalto', 'no-eligible-disk') | map(attribute='status') | first) == 'UNSAFE'
           - (task_sequence_results | selectattr('name', 'equalto', 'multiple-eligible-disks') | map(attribute='status') | first) == 'UNSAFE'
-          - (task_sequence_results | selectattr('name', 'equalto', 'formatting-disabled') | map(attribute='status') | first) == 'AUTHORIZATION_REQUIRED'
-          - (task_sequence_results | selectattr('name', 'equalto', 'formatting-disabled') | map(attribute='device') | first) == '/dev/sdb'
-          - (task_sequence_results | selectattr('name', 'equalto', 'formatting-disabled') | map(attribute='authorized') | first | bool) == false
-          - (task_sequence_results | selectattr('name', 'equalto', 'formatting-enabled') | map(attribute='status') | first) == 'READY_TO_PREPARE'
+          - (task_sequence_results | selectattr('name', 'equalto', 'explicit-safe-override') | map(attribute='status') | first) == 'READY_TO_PREPARE'
+          - (task_sequence_results | selectattr('name', 'equalto', 'automatic-formatting') | map(attribute='status') | first) == 'READY_TO_PREPARE'
+          - (task_sequence_results | selectattr('name', 'equalto', 'automatic-formatting') | map(attribute='device') | first) == '/dev/sdb'
+          - (task_sequence_results | selectattr('name', 'equalto', 'automatic-formatting') | map(attribute='authorized') | first | bool) == true
+          - (task_sequence_results | selectattr('name', 'equalto', 'automatic-formatting-repeat') | map(attribute='status') | first) == 'READY_TO_PREPARE'
           - (task_sequence_results | selectattr('name', 'equalto', 'existing-valid-mount') | map(attribute='status') | first) == 'PREPARED'
+          - (task_sequence_results | selectattr('name', 'equalto', 'existing-filesystem') | map(attribute='status') | first) == 'UNSAFE'
+          - (task_sequence_results | selectattr('name', 'equalto', 'identity-unknown') | map(attribute='status') | first) == 'UNSAFE'
 
     - name: Exercise the final unsafe-storage failure gate
       ansible.builtin.fail:
@@ -142,20 +158,19 @@
           - (disk_cases | selectattr('name', 'equalto', 'os-disk-rejection') | map(attribute='selected') | first) == ''
           - (disk_cases | selectattr('name', 'equalto', 'multiple-eligible-disks') | map(attribute='selected') | first) == ''
 
-    - name: Model explicit formatting authorization
+    - name: Model automatic formatting authorization from verified unused state
       ansible.builtin.set_fact:
         formatting_cases:
-          - { name: unauthorized, allow: false, existing: false, changes: 0, result: pending }
-          - { name: authorized, allow: true, existing: false, changes: 1, result: formatted }
-          - { name: existing-mount, allow: false, existing: true, changes: 0, result: preserved }
+          - { name: verified-unused, existing: false, changes: 1, result: formatted }
+          - { name: existing-mount, existing: true, changes: 0, result: preserved }
+          - { name: rejected-existing-filesystem, existing: false, changes: 0, result: rejected }
 
-    - name: Assert formatting requires opt-in and preserves existing mounts
+    - name: Assert formatting is safety-gated and preserves existing mounts
       ansible.builtin.assert:
         that:
-          - (formatting_cases | selectattr('name', 'equalto', 'unauthorized') | map(attribute='result') | first) == 'pending'
-          - (formatting_cases | selectattr('name', 'equalto', 'authorized') | map(attribute='result') | first) == 'formatted'
+          - (formatting_cases | selectattr('name', 'equalto', 'verified-unused') | map(attribute='result') | first) == 'formatted'
           - (formatting_cases | selectattr('name', 'equalto', 'existing-mount') | map(attribute='result') | first) == 'preserved'
-          - (formatting_cases | selectattr('name', 'equalto', 'unauthorized') | map(attribute='changes') | first | int) == 0
+          - (formatting_cases | selectattr('name', 'equalto', 'rejected-existing-filesystem') | map(attribute='changes') | first | int) == 0
 
     - name: Model idempotent second execution
       ansible.builtin.set_fact:
@@ -217,7 +232,6 @@
       ansible.builtin.set_fact:
         report_storage_states:
           control_plane: NOT_APPLICABLE
-          awaiting_authorization: AUTHORIZATION_REQUIRED
           existing_mount: COMPLETE
           prepared_current_run: COMPLETE
 
@@ -225,6 +239,5 @@
       ansible.builtin.assert:
         that:
           - report_storage_states.control_plane == 'NOT_APPLICABLE'
-          - report_storage_states.awaiting_authorization == 'AUTHORIZATION_REQUIRED'
           - report_storage_states.existing_mount == 'COMPLETE'
           - report_storage_states.prepared_current_run == 'COMPLETE'

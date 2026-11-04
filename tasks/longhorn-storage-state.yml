@@ -8,10 +8,10 @@
       {% set rejected = [] %}
       {% for line in prepare_nodes_disk_discovery.stdout_lines | default([]) %}
       {% set fields = line.split('\t') %}
-      {% if fields | length >= 3 and fields[0] == 'UNUSED' and fields[2] is match('^[0-9]+$') %}
-      {% set _ = unused.append({'device': fields[1], 'size_bytes': fields[2] | int, 'size_gb': (fields[2] | int / 1000000000) | round(2), 'state': 'unused'}) %}
+      {% if fields | length >= 4 and fields[0] == 'UNUSED' and fields[2] is match('^[0-9]+$') and fields[3] | trim | length > 0 %}
+      {% set _ = unused.append({'device': fields[1], 'size_bytes': fields[2] | int, 'size_gb': (fields[2] | int / 1000000000) | round(2), 'identity': fields[3] | trim, 'state': 'unused'}) %}
       {% elif fields | length >= 4 and fields[0] == 'REJECT' %}
-      {% set _ = rejected.append({'device': fields[1], 'size_bytes': fields[2] | int if fields[2] is match('^[0-9]+$') else 0, 'size_gb': (fields[2] | int / 1000000000) | round(2) if fields[2] is match('^[0-9]+$') else 'unknown', 'state': 'rejected', 'reason': fields[3]}) %}
+      {% set _ = rejected.append({'device': fields[1], 'size_bytes': fields[2] | int if fields[2] is match('^[0-9]+$') else 0, 'size_gb': (fields[2] | int / 1000000000) | round(2) if fields[2] is match('^[0-9]+$') else 'unknown', 'state': 'rejected', 'reason': fields[3], 'identity': fields[4] | default('') | trim}) %}
       {% endif %}
       {% endfor %}
       {{ {'unused': unused, 'rejected': rejected} | to_json }}
@@ -30,6 +30,7 @@
     prepare_nodes_mounted_disk: "{{ prepare_nodes_mount_fields[4] | default('') }}"
     prepare_nodes_mounted_size: "{{ prepare_nodes_mount_fields[5] | default('0') | int }}"
     prepare_nodes_mounted_uuid: "{{ prepare_nodes_mount_fields[6] | default('') }}"
+    prepare_nodes_mounted_fstab_source: "{{ prepare_nodes_mount_fields[7] | default('') }}"
     prepare_nodes_existing_mount: "{{ (prepare_nodes_mount_fields[1] | default('')) | length > 0 }}"
     prepare_nodes_suitable_disks_json: >-
       {% set suitable = [] %}
@@ -52,9 +53,9 @@
       {% set minimum = prerequisites_requirements.worker.data_disk_gb | int * 1000000000 %}
       {% set override = prerequisites_data_disk_device | default('') | trim %}
       {% set override_matches = prepare_nodes_unused_disks | selectattr('device', 'equalto', override) | list %}
-      {% set mounted_valid = prepare_nodes_existing_mount and prepare_nodes_mounted_disk | length > 0 and prepare_nodes_mounted_disk != prepare_nodes_root_disk and prepare_nodes_mounted_fstype in prerequisites_longhorn_filesystems and prepare_nodes_mounted_size | int >= minimum and prepare_nodes_mounted_uuid | length > 0 %}
+      {% set mounted_valid = prepare_nodes_existing_mount and prepare_nodes_mounted_disk | length > 0 and prepare_nodes_mounted_disk != prepare_nodes_root_disk and prepare_nodes_mounted_fstype in prerequisites_longhorn_filesystems and prepare_nodes_mounted_size | int >= minimum and prepare_nodes_mounted_uuid | length > 0 and prepare_nodes_mounted_fstab_source == 'UUID=' ~ prepare_nodes_mounted_uuid %}
       {% set unused_valid = (override | length > 0 and override_matches | length == 1 and override_matches[0].size_bytes | int >= minimum) or (override | length == 0 and prepare_nodes_suitable_disks | length == 1) %}
-      {{ 'PREPARED' if mounted_valid else ('READY_TO_PREPARE' if not prepare_nodes_existing_mount and unused_valid and prerequisites_allow_disk_format | bool else ('AUTHORIZATION_REQUIRED' if not prepare_nodes_existing_mount and unused_valid else 'UNSAFE')) }}
+      {{ 'PREPARED' if mounted_valid else ('READY_TO_PREPARE' if not prepare_nodes_existing_mount and unused_valid else 'UNSAFE') }}
   when: prepare_nodes_role == 'worker'
 
 - name: Normalize the storage state value
@@ -64,8 +65,9 @@
 
 - name: Set selected Longhorn device and capacity from normalized candidates
   ansible.builtin.set_fact:
-    prepare_nodes_selected_device: "{{ prepare_nodes_mounted_disk if prepare_nodes_storage_status == 'PREPARED' else ((prerequisites_data_disk_device | trim) if prepare_nodes_storage_status in ['READY_TO_PREPARE', 'AUTHORIZATION_REQUIRED'] and prerequisites_data_disk_device | default('') | trim | length > 0 else (prepare_nodes_suitable_disks[0].device if prepare_nodes_storage_status in ['READY_TO_PREPARE', 'AUTHORIZATION_REQUIRED'] and prepare_nodes_suitable_disks | length == 1 else '')) }}"
-    prepare_nodes_selected_size: "{{ prepare_nodes_mounted_size if prepare_nodes_storage_status == 'PREPARED' else ((prepare_nodes_unused_disks | selectattr('device', 'equalto', prerequisites_data_disk_device | trim) | map(attribute='size_bytes') | first | int) if prepare_nodes_storage_status in ['READY_TO_PREPARE', 'AUTHORIZATION_REQUIRED'] and prerequisites_data_disk_device | default('') | trim | length > 0 else (prepare_nodes_suitable_disks[0].size_bytes | int if prepare_nodes_storage_status in ['READY_TO_PREPARE', 'AUTHORIZATION_REQUIRED'] and prepare_nodes_suitable_disks | length == 1 else 0)) }}"
+    prepare_nodes_selected_device: "{{ prepare_nodes_mounted_disk if prepare_nodes_storage_status == 'PREPARED' else ((prerequisites_data_disk_device | trim) if prepare_nodes_storage_status == 'READY_TO_PREPARE' and prerequisites_data_disk_device | default('') | trim | length > 0 else (prepare_nodes_suitable_disks[0].device if prepare_nodes_storage_status == 'READY_TO_PREPARE' and prepare_nodes_suitable_disks | length == 1 else '')) }}"
+    prepare_nodes_selected_size: "{{ prepare_nodes_mounted_size if prepare_nodes_storage_status == 'PREPARED' else ((prepare_nodes_unused_disks | selectattr('device', 'equalto', prerequisites_data_disk_device | trim) | map(attribute='size_bytes') | first | int) if prepare_nodes_storage_status == 'READY_TO_PREPARE' and prerequisites_data_disk_device | default('') | trim | length > 0 else (prepare_nodes_suitable_disks[0].size_bytes | int if prepare_nodes_storage_status == 'READY_TO_PREPARE' and prepare_nodes_suitable_disks | length == 1 else 0)) }}"
+    prepare_nodes_selected_identity: "{{ '' if prepare_nodes_storage_status == 'PREPARED' else ((prepare_nodes_unused_disks | selectattr('device', 'equalto', prerequisites_data_disk_device | trim) | map(attribute='identity') | first | default('')) if prerequisites_data_disk_device | default('') | trim | length > 0 else (prepare_nodes_suitable_disks[0].identity if prepare_nodes_storage_status == 'READY_TO_PREPARE' and prepare_nodes_suitable_disks | length == 1 else '')) }}"
     prepare_nodes_selected_fstype: "{{ prepare_nodes_mounted_fstype if prepare_nodes_storage_status == 'PREPARED' else 'ext4' }}"
     prepare_nodes_storage_authorized: "{{ prepare_nodes_storage_status in ['PREPARED', 'READY_TO_PREPARE'] }}"
   when: prepare_nodes_role == 'worker'

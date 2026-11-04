@@ -156,13 +156,14 @@
         size=''
         uuid=''
         if [ -n "$source" ] && [ -b "$source" ]; then
-          disk=$(lsblk -s -rpnbo NAME,TYPE "$source" 2>/dev/null | awk '$2 == "disk" {d=$1} END {print d}')
+          disk=$(lsblk -s -rpnbo PATH,TYPE "$source" 2>/dev/null | awk '$2 == "disk" {d=$1} END {print d}')
           size=$(lsblk -dnbo SIZE "$disk" 2>/dev/null || true)
           uuid=$(blkid -s UUID -o value "$source" 2>/dev/null || true)
         fi
-        printf 'MOUNT\t%s\t%s\t%s\t%s\t%s\t%s\n' "$source" "$fstype" "$options" "$disk" "$size" "$uuid"
+        fstab_source=$(awk -v p="$path" '$2 == p {print $1; exit}' /etc/fstab 2>/dev/null || true)
+        printf 'MOUNT\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$source" "$fstype" "$options" "$disk" "$size" "$uuid" "$fstab_source"
         root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
-        root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | xargs -r lsblk -s -b -n -o NAME,TYPE,SIZE 2>/dev/null | awk '$2 == "disk" {print $1; exit}')
+        root_disk=$(findmnt -n -o SOURCE / 2>/dev/null | xargs -r lsblk -s -rpnbo PATH,TYPE 2>/dev/null | awk '$2 == "disk" {print $1; exit}')
         printf 'ROOT\t%s\n' "$root_disk"
       args:
         executable: /bin/bash
@@ -212,13 +213,40 @@
       when:
         - prepare_nodes_role == 'worker'
 
-    - name: Report that unused-disk preparation is awaiting explicit authorization
-      ansible.builtin.debug:
-        msg: "Disk {{ prepare_nodes_selected_device }} was discovered and left untouched. Set prerequisites_allow_disk_format: true and rerun to create the ext4 filesystem and mount it."
+    - name: Revalidate the selected Longhorn disk immediately before formatting
+      ansible.builtin.shell: |
+        set +e
+        {{ prerequisites_longhorn_disk_discovery_command }}
+      args:
+        executable: /bin/bash
+      register: prepare_nodes_preformat_discovery
+      changed_when: false
       when:
         - prepare_nodes_role == 'worker'
-        - prepare_nodes_storage_status == 'AUTHORIZATION_REQUIRED'
-        - not prerequisites_allow_disk_format | bool
+        - prepare_nodes_storage_status == 'READY_TO_PREPARE'
+        - not ansible_check_mode
+
+    - name: Parse the selected disk pre-format evidence
+      ansible.builtin.set_fact:
+        prepare_nodes_preformat_root_disk: "{{ (prepare_nodes_preformat_discovery.stdout_lines | select('match', '^ROOT\\t') | list | first | default('ROOT\\t')).split('\\t')[1] | default('') }}"
+        prepare_nodes_preformat_matches: "{{ prepare_nodes_preformat_discovery.stdout_lines | select('match', '^UNUSED\\t' ~ (prepare_nodes_selected_device | regex_escape) ~ '\\t') | list }}"
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status == 'READY_TO_PREPARE'
+        - not ansible_check_mode
+
+    - name: Abort if the selected disk changed or is no longer conclusively unused
+      ansible.builtin.assert:
+        that:
+          - prepare_nodes_preformat_root_disk == prepare_nodes_root_disk
+          - prepare_nodes_preformat_matches | length == 1
+          - (prepare_nodes_preformat_matches[0].split('\t')[2] | int) >= (prerequisites_requirements.worker.data_disk_gb | int * 1000000000)
+          - prepare_nodes_preformat_matches[0].split('\t')[3] | trim == prepare_nodes_selected_identity | trim
+        fail_msg: "Selected Longhorn disk {{ prepare_nodes_selected_device }} changed or is no longer verified unused; no storage was formatted."
+      when:
+        - prepare_nodes_role == 'worker'
+        - prepare_nodes_storage_status == 'READY_TO_PREPARE'
+        - not ansible_check_mode
 
     - name: Create the Longhorn filesystem only when explicitly authorized
       ansible.builtin.command: "mkfs.ext4 {{ prepare_nodes_selected_device | quote }}"
@@ -226,7 +254,6 @@
         - prepare_nodes_role == 'worker'
         - prepare_nodes_storage_status == 'READY_TO_PREPARE'
         - not ansible_check_mode
-        - prerequisites_allow_disk_format | bool
       register: prepare_nodes_filesystem
       changed_when: true
 
@@ -273,7 +300,7 @@
       ansible.builtin.shell: |
         set -o pipefail
         source=$(findmnt -n -o SOURCE --target {{ prepare_nodes_longhorn_mount | quote }})
-        disk=$(lsblk -s -rpnbo NAME,TYPE "$source" | awk '$2 == "disk" {d=$1} END {print d}')
+        disk=$(lsblk -s -rpnbo PATH,TYPE "$source" | awk '$2 == "disk" {d=$1} END {print d}')
         fstype=$(findmnt -n -o FSTYPE --target {{ prepare_nodes_longhorn_mount | quote }})
         uuid=$(blkid -s UUID -o value "$source" 2>/dev/null || true)
         printf '%s\t%s\t%s\t%s\n' "$source" "$disk" "$fstype" "$uuid"
@@ -342,12 +369,12 @@
           Device:               {{ prepare_nodes_selected_device | default('not selected') }}
           Filesystem:           {{ prepare_nodes_selected_fstype | default('unknown') }}
           Mount:                {{ prepare_nodes_longhorn_mount }}
-          Persistent:           {{ 'YES' if prepare_nodes_storage_status == 'PREPARED' or (prepare_nodes_storage_status == 'READY_TO_PREPARE' and prepare_nodes_storage_authorized and not ansible_check_mode) else ('CHECK MODE — NOT CHANGED' if ansible_check_mode and prepare_nodes_storage_status != 'UNSAFE' else ('NO — AUTHORIZATION REQUIRED' if prepare_nodes_storage_status == 'AUTHORIZATION_REQUIRED' else 'NO')) }}
-          Storage preparation:  {{ 'COMPLETE' if prepare_nodes_storage_status == 'PREPARED' or (prepare_nodes_storage_status == 'READY_TO_PREPARE' and prepare_nodes_storage_authorized and not ansible_check_mode) else ('NOT CHANGED' if ansible_check_mode and prepare_nodes_storage_status != 'UNSAFE' else ('AUTHORIZATION REQUIRED' if prepare_nodes_storage_status == 'AUTHORIZATION_REQUIRED' else 'UNSAFE')) }}{% else %}LONGHORN
+          Persistent:           {{ 'YES' if prepare_nodes_storage_status == 'PREPARED' or (prepare_nodes_storage_status == 'READY_TO_PREPARE' and prepare_nodes_storage_authorized and not ansible_check_mode) else ('CHECK MODE — NOT CHANGED' if ansible_check_mode and prepare_nodes_storage_status != 'UNSAFE' else 'NO') }}
+          Storage preparation:  {{ 'COMPLETE' if prepare_nodes_storage_status == 'PREPARED' or (prepare_nodes_storage_status == 'READY_TO_PREPARE' and prepare_nodes_storage_authorized and not ansible_check_mode) else ('NOT CHANGED' if ansible_check_mode and prepare_nodes_storage_status != 'UNSAFE' else 'UNSAFE') }}{% else %}LONGHORN
           Storage preparation:  NOT APPLICABLE ({{ prepare_nodes_role }}){% endif %}
 
           Changes made: {{ (prepare_nodes_report_changes | default([]) | join(', ')) or 'none' }}
-          Manual actions: {{ 'Set prerequisites_allow_disk_format: true and rerun to prepare the selected unused disk.' if prepare_nodes_role == 'worker' and prepare_nodes_storage_status == 'AUTHORIZATION_REQUIRED' else 'None.' }}
+          Manual actions: None.
 
     - name: Fail after reporting unsafe or ambiguous storage
       ansible.builtin.fail:
