@@ -1,0 +1,36 @@
+---
+# All capacities use decimal bytes, matching lsblk --bytes output.
+prerequisites_requirements:
+  control_plane:
+    vcpu: 4
+    memory_gib: 8
+    os_disk_gb: 100
+    data_disk_gb: 0
+  worker:
+    vcpu: 8
+    memory_gib: 32
+    os_disk_gb: 100
+    data_disk_gb: 500
+  backup:
+    vcpu: 4
+    memory_gib: 8
+    os_disk_gb: 100
+    data_disk_gb: 2000
+
+# A VM can report slightly less usable memory than its provisioned value.
+# A value of 0.05 permits up to 5% below the nominal requirement.
+prerequisites_memory_tolerance: 0.05
+
+# Set this per host or role group when automatic identification is not certain.
+# Example: prerequisites_data_disk_device: /dev/sdb
+prerequisites_data_disk_device: ""
+
+# Only explicitly configured endpoints are tested. Each item may contain:
+# name, host, port, and tls (true/false).
+prerequisites_network_endpoints: []
+
+# These settings are useful context but are normally configurable by RKE2.
+prerequisites_installation_deferred_settings:
+  - br_netfilter module loaded
+  - net.bridge.bridge-nf-call-iptables enabled
+  - iscsiadm available on workers

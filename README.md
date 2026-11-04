@@ -1,6 +1,6 @@
-# Ansible Semaphore Connectivity Test
+# Ansible Semaphore Connectivity and RKE2 Validation
 
-Minimal, read-only Ansible content for verifying that Ansible Semaphore can connect to a Linux VM in Proxmox2.
+Read-only Ansible content for verifying Semaphore connectivity and validating whether Linux VMs are suitable for a future RKE2 installation.
 
 ## Repository structure
 
@@ -12,7 +12,10 @@ ansible-semaphore/
 │   └── lab/
 │       └── hosts.yml
 ├── playbooks/
-│   └── connectivity.yml
+│   ├── connectivity.yml
+│   └── prerequisites.yml
+├── vars/
+│   └── prerequisites.yml
 └── .gitignore
 ```
 
@@ -23,16 +26,57 @@ ansible-semaphore/
 - An SSH user on the target VM. The user does not need sudo or root privileges.
 - A separate SSH key for GitHub repository access and target VM access.
 
-## Inventory configuration
+## Inventory and node roles
 
-Edit `inventories/lab/hosts.yml` and replace the two placeholders:
+`proxmox2_targets` remains the parent group used by the connectivity playbook. Put each host in exactly one role group:
 
-- `REPLACE_WITH_PROXMOX2_ADDRESS`: target IP address or DNS name.
-- `REPLACE_WITH_SSH_USERNAME`: SSH username on the target VM.
+- `control_plane` — RKE2 control-plane nodes.
+- `worker` — RKE2 worker nodes and Longhorn storage nodes.
+- `backup` — standalone backup/S3 infrastructure; Kubernetes checks are skipped.
+
+Role membership is authoritative. A host in no role group or multiple role groups receives a mandatory FAIL.
+
+Edit `inventories/lab/hosts.yml` to configure addresses and users:
+
+- Set `ansible_host` to the target IP address or DNS name.
+- Set `ansible_user` to the SSH username on the target VM.
 
 Do not add passwords or private keys to the inventory or any other tracked file.
 
-## Local execution
+## Prerequisites validation
+
+The validation supports Ubuntu 24.04 and Debian 13. Other Linux distributions receive a warning. It checks operating-system facts, x86_64 architecture, CPU, memory, root storage, networking, time synchronization, swap, kernel modules and parameters, firewall utilities, existing Kubernetes/RKE2 processes, Longhorn-related worker dependencies, and explicitly configured endpoints.
+
+Requirements are configured in `vars/prerequisites.yml`. Memory uses a configurable tolerance because usable guest memory can be slightly below provisioned VM memory.
+
+Dedicated worker or backup disks must be explicitly identified, for example with a host or group variable:
+
+```yaml
+prerequisites_data_disk_device: /dev/sdb
+```
+
+The playbook never assumes an unmounted disk is safe, and never partitions, formats, mounts, installs, configures, or restarts anything. Disk discovery reports block devices, filesystems, mount points, provisioned capacity, and filesystem capacity. A confirmed missing or undersized required disk is FAIL; an ambiguous disk identity is WARN.
+
+Network endpoint checks are disabled by default. Add only explicitly approved endpoints to `prerequisites_network_endpoints` in inventory or variables. Checks distinguish DNS, TCP, and optional TLS connectivity. Successful TCP or TLS connectivity does not prove application authorization or API-level access. No public service is tested implicitly.
+
+Status meanings:
+
+- PASS — requirement satisfied.
+- WARN — non-blocking issue, uncertainty, or setting that a future RKE2 installation can configure.
+- FAIL — mandatory infrastructure requirement is not satisfied, including missing/conflicting role assignment.
+- SKIP — not applicable or not configured.
+
+The overall result is `READY`, `READY WITH WARNINGS`, or `NOT READY`. The complete report is printed before the playbook returns nonzero for mandatory failures.
+
+Run locally with:
+
+```bash
+ansible-playbook \
+  -i inventories/lab/hosts.yml \
+  playbooks/prerequisites.yml
+```
+
+## Local connectivity execution
 
 From the repository root:
 
@@ -60,7 +104,7 @@ This key is used only for Git operations. It is not the key Ansible should use f
 1. Add a different SSH private key to the Semaphore Key Store.
 2. Select or associate that key with the project, environment, or task template used for this Ansible job, according to the Semaphore deployment configuration.
 3. Install the corresponding public key in the target user's `~/.ssh/authorized_keys` on Proxmox2.
-4. Replace the inventory address and username placeholders.
+4. Confirm the inventory address and username are correct.
 
 This key is used only by Ansible when connecting to the target VM. Semaphore supplies it to the task execution environment; it is not stored in Git or referenced by a private-key path committed to the repository.
 
@@ -69,6 +113,14 @@ Configure the task template to use this repository and inventory, then execute:
 ```bash
 ansible-playbook -i inventories/lab/hosts.yml playbooks/connectivity.yml
 ```
+
+For validation, configure the Semaphore task template with the same repository and target SSH key, then run:
+
+```bash
+ansible-playbook -i inventories/lab/hosts.yml playbooks/prerequisites.yml
+```
+
+The validation defaults to no privilege escalation. Some diagnostics may therefore be unavailable and will be reported as WARN rather than causing an incomplete report.
 
 The repository key is used before task execution to clone the repository. The target key is used during task execution for SSH connections from Semaphore to Proxmox2. Keep these keys independent and rotate them independently.
 
