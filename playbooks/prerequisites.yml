@@ -35,6 +35,19 @@
           explanation: "{{ 'Inventory role is valid.' if prerequisites_role_memberships | length == 1 else 'Assign the host to exactly one role group.' }}"
           owner: Infrastructure
 
+    - name: Check validation mode
+      ansible.builtin.set_fact:
+        prerequisites_results: "{{ prerequisites_results + [mode_result] }}"
+      vars:
+        mode_result:
+          section: SYSTEM
+          name: Validation mode
+          status: "{{ 'PASS' if rke2_validation_mode in rke2_allowed_validation_modes else 'FAIL' }}"
+          actual: "{{ rke2_validation_mode }}"
+          required: "{{ rke2_allowed_validation_modes | join(' or ') }}"
+          explanation: "{{ '' if rke2_validation_mode in rke2_allowed_validation_modes else 'Select fresh_install or existing_install.' }}"
+          owner: Infrastructure
+
   tasks:
     - name: Collect read-only diagnostic data
       ansible.builtin.shell: |
@@ -67,7 +80,8 @@
           - { key: swap, command: "cat /proc/swaps" }
           - { key: modules, command: "lsmod" }
           - { key: kernel_release, command: "uname -r" }
-          - { key: kernel_config, command: "(zgrep -E '^(CONFIG_BPF|CONFIG_BPF_EVENTS|CONFIG_BPF_SYSCALL|CONFIG_NET_CLS_BPF|CONFIG_BPF_JIT|CONFIG_NET_CLS_ACT|CONFIG_NET_SCH_INGRESS|CONFIG_DEBUG_INFO_BTF|CONFIG_CGROUPS|CONFIG_CGROUP_BPF|CONFIG_VXLAN|CONFIG_GENEVE|CONFIG_FIB_RULES)=' /proc/config.gz 2>/dev/null || grep -E '^(CONFIG_BPF|CONFIG_BPF_EVENTS|CONFIG_BPF_SYSCALL|CONFIG_NET_CLS_BPF|CONFIG_BPF_JIT|CONFIG_NET_CLS_ACT|CONFIG_NET_SCH_INGRESS|CONFIG_DEBUG_INFO_BTF|CONFIG_CGROUPS|CONFIG_CGROUP_BPF|CONFIG_VXLAN|CONFIG_GENEVE|CONFIG_FIB_RULES)=' /boot/config-$(uname -r) 2>/dev/null)" }
+          - { key: kernel_config, command: "(zgrep -E '^(CONFIG_BPF|CONFIG_BPF_EVENTS|CONFIG_BPF_SYSCALL|CONFIG_NET_CLS_BPF|CONFIG_BPF_JIT|CONFIG_NET_CLS_ACT|CONFIG_NET_SCH_INGRESS|CONFIG_DEBUG_INFO_BTF|CONFIG_CGROUPS|CONFIG_CGROUP_BPF|CONFIG_VXLAN|CONFIG_GENEVE|CONFIG_FIB_RULES|CONFIG_OVERLAY_FS|CONFIG_BRIDGE_NETFILTER|CONFIG_ISCSI_TCP|CONFIG_SCSI_ISCSI)=' /proc/config.gz 2>/dev/null || grep -E '^(CONFIG_BPF|CONFIG_BPF_EVENTS|CONFIG_BPF_SYSCALL|CONFIG_NET_CLS_BPF|CONFIG_BPF_JIT|CONFIG_NET_CLS_ACT|CONFIG_NET_SCH_INGRESS|CONFIG_DEBUG_INFO_BTF|CONFIG_CGROUPS|CONFIG_CGROUP_BPF|CONFIG_VXLAN|CONFIG_GENEVE|CONFIG_FIB_RULES|CONFIG_OVERLAY_FS|CONFIG_BRIDGE_NETFILTER|CONFIG_ISCSI_TCP|CONFIG_SCSI_ISCSI)=' /boot/config-$(uname -r) 2>/dev/null)" }
+          - { key: module_files, command: "for module in overlay br_netfilter iscsi_tcp; do find /lib/modules/$(uname -r) -type f -name \"${module}.ko*\" -print -quit 2>/dev/null | sed \"s#^#${module} AVAILABLE=#\"; done" }
           - { key: cgroups, command: "stat -fc %T /sys/fs/cgroup" }
           - { key: bpffs, command: "findmnt -n -t bpf -o TARGET,FSTYPE /sys/fs/bpf" }
           - { key: ip_forward, command: "sysctl -n net.ipv4.ip_forward" }
@@ -88,8 +102,9 @@
           - { key: chrony, command: "command -v chronyc" }
           - { key: chrony_tracking, command: "chronyc tracking" }
           - { key: timesyncd, command: "systemctl is-enabled systemd-timesyncd" }
-          - { key: kubernetes_processes, command: "ps -eo pid,args | grep -E '[r]ke2|[k]ubelet|[k]3s|[d]ockerd|[c]rio|[c]ontainerd'" }
-          - { key: runtime_services, command: "systemctl is-active rke2-server rke2-agent kubelet docker containerd crio 2>/dev/null" }
+          - { key: runtime_processes, command: "ps -eo pid=,comm=,args= | awk '$2 ~ /^(rke2|rke2-server|rke2-agent|kubelet|k3s|k3s-agent|microk8s|dockerd|crio|containerd)$/ {print}'" }
+          - { key: runtime_process_executables, command: "for pid in $(ps -eo pid=,comm= | awk '$2 ~ /^(rke2|rke2-server|rke2-agent|kubelet|k3s|k3s-agent|microk8s|dockerd|crio|containerd)$/ {print $1}'); do exe=$(readlink -f /proc/$pid/exe 2>/dev/null || true); cmd=$(tr '\\0' ' ' </proc/$pid/cmdline 2>/dev/null || true); printf 'PID=%s EXECUTABLE=%s CMDLINE=%s\\n' \"$pid\" \"$exe\" \"$cmd\"; done" }
+          - { key: runtime_services, command: "for service in rke2-server rke2-agent kubelet k3s k3s-agent microk8s docker crio containerd; do state=$(systemctl show \"$service\" --property=ActiveState --value 2>/dev/null || true); printf '%s ActiveState=%s\\n' \"$service\" \"$state\"; done" }
       register: prerequisites_diagnostics
       changed_when: false
       failed_when: false
@@ -196,8 +211,8 @@
         network_items:
           - { section: NETWORK, name: IPv4 address, status: "{{ 'PASS' if addresses else 'FAIL' }}", actual: "{{ addresses.splitlines() | first if addresses else 'none' }}", required: Global IPv4 address, explanation: "{{ '' if addresses else 'Assign a routable IPv4 address.' }}", owner: Infrastructure }
           - { section: NETWORK, name: Default route, status: "{{ 'PASS' if prerequisites_diag.get('default_route', {}).get('stdout', '') | trim else 'FAIL' }}", actual: "{{ 'Configured' if prerequisites_diag.get('default_route', {}).get('stdout', '') | trim else 'Unavailable' }}", required: Default route, explanation: "{{ '' if prerequisites_diag.get('default_route', {}).get('stdout', '') | trim else 'Configure a default route.' }}", owner: Infrastructure }
-          - { section: NETWORK, name: Hostname resolution, status: "{{ 'PASS' if has_global else 'WARN' }}", actual: "{{ resolved.splitlines() | first if resolved else 'unavailable' }}", required: Hostname resolves to node IP, explanation: "{{ '' if has_global else ('Hostname resolves only to loopback; map it to the routable node address.' if loopback_only else 'Hostname does not resolve to a routable node address.') }}", owner: Infrastructure }
-          - { section: NETWORK, name: DNS resolvers, status: "{{ 'PASS' if prerequisites_diag.get('resolv_conf', {}).get('stdout', '') | trim else 'WARN' }}", actual: "{{ prerequisites_diag.get('resolv_conf', {}).get('stdout', 'none') | trim }}", required: Configured resolvers, explanation: "Configure DNS resolvers.", owner: Infrastructure }
+          - { section: NETWORK, name: Hostname resolution, status: "{{ 'PASS' if has_global else 'WARN' }}", actual: "{{ resolved.splitlines() | first if resolved else 'unavailable' }}", required: Hostname resolves to node IP, explanation: "{{ '' if has_global else ('Hostname resolves only to loopback; map it to the routable node address.' if loopback_only else 'Hostname does not resolve to a routable node address.') }}", evidence_verified: "{{ resolved | length > 0 }}", owner: Infrastructure }
+          - { section: NETWORK, name: DNS resolvers, status: "{{ 'PASS' if prerequisites_diag.get('resolv_conf', {}).get('stdout', '') | trim else 'WARN' }}", actual: "{{ prerequisites_diag.get('resolv_conf', {}).get('stdout', 'none') | trim }}", required: Configured resolvers, explanation: "Configure DNS resolvers.", evidence_verified: true, owner: Infrastructure }
 
     - name: Validate time synchronization
       ansible.builtin.set_fact:
@@ -219,15 +234,25 @@
         prerequisites_results: "{{ prerequisites_results + kube_items }}"
       vars:
         modules: "{{ prerequisites_diag.get('modules', {}).get('stdout', '') }}"
+        kernel_config: "{{ prerequisites_diag.get('kernel_config', {}).get('stdout', '') | trim }}"
+        module_files: "{{ prerequisites_diag.get('module_files', {}).get('stdout', '') | trim }}"
+        data_raw: "{{ prerequisites_data_disk.stdout | default('') | trim }}"
+        data_fields: "{{ data_raw.split() }}"
+        data_valid: "{{ data_fields | length >= 3 and data_fields[1] == 'disk' and data_fields[2] is match('^[0-9]+$') }}"
         swap: "{{ prerequisites_diag.get('swap', {}).get('stdout_lines', []) | length > 1 }}"
+        runtime_services: "{{ prerequisites_diag.get('runtime_services', {}).get('stdout', '') | trim }}"
+        runtime_processes: "{{ prerequisites_diag.get('runtime_processes', {}).get('stdout', '') | trim }}"
+        runtime_executables: "{{ prerequisites_diag.get('runtime_process_executables', {}).get('stdout', '') | trim }}"
+        verified_incompatible_runtime: "{{ runtime_services is search('(?m)^(k3s|k3s-agent|microk8s) ActiveState=active$') and runtime_processes is search('(?m)^( *[0-9]+ +)(k3s|k3s-agent|microk8s) ') }}"
+        active_runtime_evidence: "{{ runtime_services is search('(?m)^(k3s|k3s-agent|microk8s|kubelet|docker|crio|rke2-server|rke2-agent) ActiveState=active$') or runtime_processes is search('(?m)^( *[0-9]+ +)(k3s|k3s-agent|microk8s|kubelet|dockerd|crio|rke2|rke2-server|rke2-agent) ') }}"
         kube_items:
           - { section: RKE2, name: Swap, status: "{{ 'FAIL' if swap and prerequisites_role in ['control_plane', 'worker'] else ('SKIP' if prerequisites_role == 'backup' else 'PASS') }}", actual: "{{ 'Enabled' if swap else 'Disabled' }}", required: Disabled, explanation: "Disable swap before RKE2 installation.", owner: Infrastructure }
-          - { section: RKE2, name: overlay module, status: "{{ 'PASS' if 'overlay' in modules else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ 'Loaded' if 'overlay' in modules else 'Not loaded' }}", required: Loaded, explanation: "Carekube can configure this during installation.", owner: Carekube }
-          - { section: RKE2, name: br_netfilter module, status: "{{ 'PASS' if 'br_netfilter' in modules else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ 'Loaded' if 'br_netfilter' in modules else 'Not loaded' }}", required: Loaded, explanation: "Carekube can configure this during installation.", owner: Carekube }
+          - { section: RKE2, name: overlay module, status: "{{ 'PASS' if 'overlay' in modules or 'CONFIG_OVERLAY_FS=y' in kernel_config else ('WARN' if 'overlay AVAILABLE=' in module_files else ('SKIP' if rke2_validation_mode == 'fresh_install' else 'WARN')) }}", actual: "{{ 'Loaded' if 'overlay' in modules else ('Built-in' if 'CONFIG_OVERLAY_FS=y' in kernel_config else ('Available but unloaded' if 'overlay AVAILABLE=' in module_files else 'Unavailable or unverifiable')) }}", required: Loaded or built-in, explanation: "Carekube can configure this during installation when available but unloaded.", owner: Carekube }
+          - { section: RKE2, name: br_netfilter module, status: "{{ 'PASS' if 'br_netfilter' in modules or 'CONFIG_BRIDGE_NETFILTER=y' in kernel_config else ('WARN' if 'br_netfilter AVAILABLE=' in module_files else ('SKIP' if rke2_validation_mode == 'fresh_install' else 'WARN')) }}", actual: "{{ 'Loaded' if 'br_netfilter' in modules else ('Built-in' if 'CONFIG_BRIDGE_NETFILTER=y' in kernel_config else ('Available but unloaded' if 'br_netfilter AVAILABLE=' in module_files else 'Unavailable or unverifiable')) }}", required: Loaded or built-in, explanation: "Carekube can configure this during installation when available but unloaded.", owner: Carekube }
           - { section: RKE2, name: IPv4 forwarding, status: "{{ 'PASS' if prerequisites_diag.get('ip_forward', {}).get('stdout', '') | trim == '1' else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ prerequisites_diag.get('ip_forward', {}).get('stdout', 'unknown') | trim }}", required: Enabled, explanation: "Carekube can configure this during installation.", owner: Carekube }
           - { section: RKE2, name: bridge-nf-call-iptables, status: "{{ 'PASS' if prerequisites_diag.get('bridge_iptables', {}).get('stdout', '') | trim == '1' else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ prerequisites_diag.get('bridge_iptables', {}).get('stdout', 'unknown') | trim }}", required: Enabled, explanation: "Carekube can configure this during installation.", owner: Carekube }
           - { section: RKE2, name: iptables or nftables, status: "{{ 'PASS' if prerequisites_diag.get('iptables', {}).get('rc', 1) | int == 0 or prerequisites_diag.get('nft', {}).get('rc', 1) | int == 0 else ('WARN' if prerequisites_role in ['control_plane', 'worker'] else 'SKIP') }}", actual: "{{ 'Available' if prerequisites_diag.get('iptables', {}).get('rc', 1) | int == 0 or prerequisites_diag.get('nft', {}).get('rc', 1) | int == 0 else 'Unavailable' }}", required: Firewall utility available, explanation: "Carekube can install or provide this during installation.", owner: Carekube }
-          - { section: RKE2, name: Existing Kubernetes processes, status: "{{ 'FAIL' if prerequisites_diag.get('runtime_services', {}).get('stdout', '') | trim and ('active' in prerequisites_diag.get('runtime_services', {}).get('stdout', '') | lower) and prerequisites_diag.get('kubernetes_processes', {}).get('stdout', '') | trim else ('WARN' if prerequisites_diag.get('kubernetes_processes', {}).get('stdout', '') | trim else ('SKIP' if prerequisites_role == 'backup' else 'PASS')) }}", actual: "{{ 'Active conflicting runtime detected' if prerequisites_diag.get('runtime_services', {}).get('stdout', '') | trim and prerequisites_diag.get('kubernetes_processes', {}).get('stdout', '') | trim else 'None detected' }}", required: No active conflicting runtime, explanation: "Stop or remove the verified conflicting runtime before RKE2 installation.", owner: Infrastructure }
+          - { section: RKE2, name: Existing Kubernetes processes, status: "{{ 'FAIL' if verified_incompatible_runtime or (rke2_validation_mode == 'fresh_install' and rke2_clean_install_policy | bool and runtime_services is search('(?m)^(rke2-server|rke2-agent) ActiveState=active$')) else ('WARN' if active_runtime_evidence else ('SKIP' if rke2_validation_mode == 'fresh_install' or prerequisites_role == 'backup' else 'PASS')) }}", actual: "{{ 'Verified incompatible Kubernetes runtime' if verified_incompatible_runtime else ('Runtime evidence requires review' if active_runtime_evidence else 'No incompatible runtime evidence') }}", evidence: "{{ (runtime_services ~ '\\n' ~ runtime_executables ~ '\\n' ~ runtime_processes) | trim }}", required: "No verified incompatible runtime", explanation: "{{ 'Stop or remove the verified incompatible runtime before RKE2 installation.' if verified_incompatible_runtime else ('Review the exact service/process evidence; containerd alone is compatible with RKE2.' if active_runtime_evidence else '') }}", owner: Infrastructure }
           - { section: RKE2, name: NetworkManager compatibility, status: "{{ 'PASS' if not ('active' in prerequisites_diag.get('network_manager', {}).get('stdout', '') | lower) or prerequisites_diag.get('network_manager_cni', {}).get('stdout', '') | trim else 'WARN' }}", actual: "{{ 'CNI interfaces excluded' if prerequisites_diag.get('network_manager_cni', {}).get('stdout', '') | trim else 'No CNI exclusion evidence' }}", required: Ignore CNI-managed interfaces when enabled, explanation: "Carekube can configure NetworkManager during installation.", owner: Carekube }
           - { section: RKE2, name: Local port state, status: "{{ 'SKIP' if not prerequisites_diag.get('runtime_services', {}).get('stdout', '') | trim else 'WARN' }}", actual: "{{ 'RKE2 not installed; runtime listeners not applicable' if not prerequisites_diag.get('runtime_services', {}).get('stdout', '') | trim else 'Inspect local listeners' }}", required: Runtime ports after installation, explanation: "Local listening state is separate from firewall configuration and is checked after RKE2 services exist.", owner: Carekube }
 
@@ -249,11 +274,14 @@
       ansible.builtin.set_fact:
         prerequisites_results: "{{ prerequisites_results + longhorn_items }}"
       vars:
+        modules: "{{ prerequisites_diag.get('modules', {}).get('stdout', '') }}"
+        kernel_config: "{{ prerequisites_diag.get('kernel_config', {}).get('stdout', '') | trim }}"
+        module_files: "{{ prerequisites_diag.get('module_files', {}).get('stdout', '') | trim }}"
         longhorn_items:
-          - { section: LONGHORN, name: iSCSI initiator tools, status: "{{ 'PASS' if prerequisites_role == 'worker' and prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int == 0 and prerequisites_diag.get('iscsid', {}).get('rc', 1) | int == 0 else ('WARN' if prerequisites_role == 'worker' else 'SKIP') }}", actual: "{{ 'Available' if prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int == 0 else 'Carekube can install it' }}", required: iscsiadm and iscsid for V1, explanation: "Carekube can install and enable open-iscsi during Longhorn preparation.", owner: Carekube }
-          - { section: LONGHORN, name: iSCSI kernel capability, status: "{{ 'PASS' if prerequisites_role != 'worker' or prerequisites_diag.get('iscsi_tcp', {}).get('stdout', '') | trim else 'WARN' }}", actual: "{{ 'Loaded' if prerequisites_diag.get('iscsi_tcp', {}).get('stdout', '') | trim else 'Not loaded or unavailable' }}", required: iscsi_tcp capability, explanation: "Carekube can configure the kernel capability during installation.", owner: Carekube }
-          - { section: LONGHORN, name: Filesystem utilities, status: "{{ 'PASS' if prerequisites_role != 'worker' or prerequisites_diag.get('longhorn_utilities', {}).get('stdout_lines', []) | length >= 2 else 'WARN' }}", actual: "{{ prerequisites_diag.get('longhorn_utilities', {}).get('stdout', 'Unavailable') | trim }}", required: ext4/XFS and storage utilities, explanation: "Carekube can install missing filesystem utilities.", owner: Carekube }
-          - { section: LONGHORN, name: Data path, status: "{{ 'PASS' if prerequisites_role != 'worker' or prerequisites_diag.get('longhorn_path', {}).get('stdout', '') | trim else 'SKIP' }}", actual: "{{ prerequisites_diag.get('longhorn_path', {}).get('stdout', 'Not mounted; acceptable before installation') | trim }}", required: Dedicated Longhorn data path, explanation: "A dedicated device is validated separately; formatting and mounting are not required before installation.", owner: Infrastructure }
+          - { section: LONGHORN, name: iSCSI initiator tools, status: "{{ 'SKIP' if prerequisites_role != 'worker' else ('PASS' if prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int == 0 and prerequisites_diag.get('iscsid', {}).get('rc', 1) | int == 0 else 'WARN') }}", actual: "{{ 'Not applicable' if prerequisites_role != 'worker' else ('Available' if prerequisites_diag.get('iscsiadm', {}).get('rc', 1) | int == 0 and prerequisites_diag.get('iscsid', {}).get('rc', 1) | int == 0 else 'Missing; Carekube can install it') }}", required: iscsiadm and iscsid for V1, explanation: "{{ 'Carekube can install and enable open-iscsi during Longhorn preparation.' if prerequisites_role == 'worker' else '' }}", owner: Carekube }
+          - { section: LONGHORN, name: iSCSI kernel capability, status: "{{ 'SKIP' if prerequisites_role != 'worker' else ('PASS' if 'iscsi_tcp' in modules or 'CONFIG_ISCSI_TCP=y' in kernel_config else 'WARN') }}", actual: "{{ 'Not applicable' if prerequisites_role != 'worker' else ('Loaded' if 'iscsi_tcp' in modules else ('Built-in' if 'CONFIG_ISCSI_TCP=y' in kernel_config else ('Available but unloaded' if 'iscsi_tcp AVAILABLE=' in module_files else 'Unavailable or unverifiable'))) }}", required: iscsi_tcp loaded or built-in, explanation: "{{ 'Carekube can load or configure iscsi_tcp during installation.' if prerequisites_role == 'worker' and 'iscsi_tcp' not in modules and 'CONFIG_ISCSI_TCP=y' not in kernel_config else '' }}", owner: Carekube }
+          - { section: LONGHORN, name: Filesystem utilities, status: "{{ 'SKIP' if prerequisites_role != 'worker' else ('PASS' if prerequisites_diag.get('longhorn_utilities', {}).get('stdout_lines', []) | length >= 2 else 'WARN') }}", actual: "{{ 'Not applicable' if prerequisites_role != 'worker' else (prerequisites_diag.get('longhorn_utilities', {}).get('stdout', 'Missing; Carekube can install them') | trim) }}", required: ext4/XFS and storage utilities, explanation: "{{ 'Carekube can install missing filesystem utilities.' if prerequisites_role == 'worker' else '' }}", owner: Carekube }
+          - { section: LONGHORN, name: Data path, status: "{{ 'SKIP' if prerequisites_role != 'worker' else ('PASS' if prerequisites_data_disk_device | default('') | trim and data_valid and data_fields[2] | int >= (prerequisites_requirements[prerequisites_role].data_disk_gb | int * 1000000000) else ('FAIL' if prerequisites_role == 'worker' and data_valid and data_fields[2] | int < (prerequisites_requirements[prerequisites_role].data_disk_gb | int * 1000000000) else 'WARN')) }}", actual: "{{ 'Not applicable' if prerequisites_role != 'worker' else (prerequisites_diag.get('longhorn_path', {}).get('stdout', '') | trim | default('Not mounted; acceptable before installation', true)) }}", explanation: "{{ 'Verify the dedicated worker disk identity and capacity.' if prerequisites_role == 'worker' and (not data_valid or prerequisites_data_disk_device | default('') | trim == '') else ('Increase the dedicated worker disk capacity.' if prerequisites_role == 'worker' and data_valid and data_fields[2] | int < (prerequisites_requirements[prerequisites_role].data_disk_gb | int * 1000000000) else '') }}", required: Dedicated Longhorn disk identity and capacity, owner: Infrastructure }
 
     - name: Validate configured network endpoints
       ansible.builtin.set_fact:
@@ -273,8 +301,9 @@
           {% set mandatory = result.name in prerequisites_mandatory_infrastructure_checks %}
           {% set applicable = result.status != 'SKIP' or result.name == 'Dedicated role data disk' and prerequisites_role in ['worker', 'backup'] %}
           {% set infrastructure = result.owner | default('Validation') == 'Infrastructure' %}
-          {% set incomplete = mandatory and applicable and infrastructure and result.status in ['WARN', 'SKIP'] %}
-          {% set _ = normalized.append(result | combine({'mandatory': mandatory, 'applicable': applicable, 'verified': result.status in ['PASS', 'FAIL'], 'incomplete': incomplete, 'phase': ('Infrastructure' if infrastructure else 'Installation/runtime')})) %}
+          {% set verified = result.get('evidence_verified', result.status in ['PASS', 'FAIL'] or result.name in ['Operating system', 'Time synchronization']) %}
+          {% set incomplete = result.get('incomplete', mandatory and applicable and infrastructure and not verified) %}
+          {% set _ = normalized.append(result | combine({'mandatory': mandatory, 'applicable': applicable, 'verified': verified, 'incomplete': incomplete, 'phase': ('Infrastructure' if infrastructure else 'Installation/runtime')})) %}
           {% endfor %}
           {{ normalized | to_json }}
       no_log: true
@@ -303,20 +332,23 @@
 
           ACTION REQUIRED — INFRASTRUCTURE BLOCKERS
           ------------------------------------------------------------------------
-          Status  Owner          Issue
-          {% for result in prerequisites_results if result.status == 'FAIL' %}{{ '%-7s %-14s %s' | format(result.status, result.owner | default('Validation') | truncate(14, true, '...'), ((result.name | default('Check')) ~ ': ' ~ (result.explanation | default('Review this diagnostic.'))) | replace('\n', ' ') | replace('\r', ' ') | truncate(56, true, '...')) }}
+          {% for result in prerequisites_results if result.status == 'FAIL' %}- {{ result.status }} — {{ result.owner | default('Validation') }} — {{ result.name | default('Check') }}
+          Evidence: {{ result.evidence | default(result.actual | default('Unavailable')) }}
+          Remediation: {{ result.explanation | default('Review this diagnostic.') }}
           {% endfor %}
 
           ACTION REQUIRED — CAREKUBE INSTALLATION TASKS
           ------------------------------------------------------------------------
-          Status  Owner          Issue
-          {% for result in prerequisites_results if result.status == 'WARN' and result.owner | default('') == 'Carekube' %}{{ '%-7s %-14s %s' | format(result.status, result.owner | truncate(14, true, '...'), ((result.name | default('Check')) ~ ': ' ~ (result.explanation | default('Review this diagnostic.'))) | replace('\n', ' ') | replace('\r', ' ') | truncate(56, true, '...')) }}
+          {% for result in prerequisites_results if result.status == 'WARN' and result.owner | default('') == 'Carekube' %}- {{ result.status }} — {{ result.owner }} — {{ result.name | default('Check') }}
+          Evidence: {{ result.evidence | default(result.actual | default('Unavailable')) }}
+          Remediation: {{ result.explanation | default('Review this diagnostic.') }}
           {% endfor %}
 
           INCOMPLETE — UNVERIFIED INFRASTRUCTURE REQUIREMENTS
           ------------------------------------------------------------------------
-          Status  Owner          Issue
-          {% for result in prerequisites_results if result.incomplete | default(false) | bool %}{{ '%-7s %-14s %s' | format('INCOMPLETE', result.owner | default('Infrastructure') | truncate(14, true, '...'), ((result.name | default('Check')) ~ ': ' ~ (result.explanation | default('Verify this requirement.'))) | replace('\n', ' ') | replace('\r', ' ') | truncate(56, true, '...')) }}
+          {% for result in prerequisites_results if result.incomplete | default(false) | bool %}- INCOMPLETE — {{ result.owner | default('Infrastructure') }} — {{ result.name | default('Check') }}
+          Evidence: {{ result.evidence | default(result.actual | default('Unavailable')) }}
+          Remediation: {{ result.explanation | default('Verify this requirement.') }}
           {% endfor %}
 
           DETAILED VALIDATION RESULTS

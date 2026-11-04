@@ -268,3 +268,109 @@
           - "'SYSTEM STORAGE NETWORK RKE2 CILIUM LONGHORN'.split() | length == 6"
           - "'SYSTEM STORAGE NETWORK RKE2 CILIUM LONGHORN'.split() | difference(['SYSTEM', 'STORAGE', 'NETWORK', 'RKE2', 'CILIUM', 'LONGHORN']) | length == 0"
           - "'KUBERNETES' not in 'SYSTEM STORAGE NETWORK RKE2 CILIUM LONGHORN'.split()"
+
+    - name: Model exact runtime service and process evidence
+      ansible.builtin.set_fact:
+        inactive_services: "rke2-server ActiveState=inactive\nkubelet ActiveState=inactive"
+        active_k3s_services: "k3s ActiveState=active"
+        containerd_processes: "  321 containerd /usr/bin/containerd"
+        k3s_processes: "  654 k3s /usr/bin/k3s server"
+        k3s_executables: "PID=654 EXECUTABLE=/usr/bin/k3s CMDLINE=/usr/bin/k3s server"
+
+    - name: Derive exact runtime conflict states
+      ansible.builtin.set_fact:
+        inactive_is_active: "{{ inactive_services is search('(?m)^rke2-server ActiveState=active$') }}"
+        containerd_is_conflict: "{{ containerd_processes is search('(?m)^ *[0-9]+ +(k3s|kubelet|rke2|microk8s) ') }}"
+        k3s_is_verified_conflict: "{{ active_k3s_services is search('(?m)^k3s ActiveState=active$') and k3s_processes is search('(?m)^ *[0-9]+ +k3s ') }}"
+
+    - name: Assert runtime false positives and genuine conflict evidence
+      ansible.builtin.assert:
+        that:
+          - not inactive_is_active
+          - not containerd_is_conflict
+          - k3s_is_verified_conflict
+          - "'PID=654' in k3s_executables"
+          - "'/usr/bin/k3s' in k3s_executables"
+          - "'/usr/bin/k3s server' in k3s_executables"
+
+    - name: Model kernel capability states
+      ansible.builtin.set_fact:
+        loaded_capability: "{{ 'PASS' if 'iscsi_tcp' in 'overlay br_netfilter iscsi_tcp' else 'WARN' }}"
+        builtin_capability: "{{ 'PASS' if 'CONFIG_ISCSI_TCP=y' in 'CONFIG_ISCSI_TCP=y' else 'WARN' }}"
+        available_unloaded_capability: "{{ 'WARN' if 'iscsi_tcp AVAILABLE=' in 'iscsi_tcp AVAILABLE=/lib/modules/iscsi_tcp.ko' else 'FAIL' }}"
+        missing_capability: "{{ 'WARN' if '' == '' else 'PASS' }}"
+
+    - name: Assert kernel capability classification
+      ansible.builtin.assert:
+        that:
+          - loaded_capability == 'PASS'
+          - builtin_capability == 'PASS'
+          - available_unloaded_capability == 'WARN'
+          - missing_capability == 'WARN'
+
+    - name: Model Longhorn role and disk states
+      ansible.builtin.set_fact:
+        control_plane_longhorn_status: SKIP
+        valid_unmounted_disk_status: PASS
+        undersized_disk_status: FAIL
+        ambiguous_disk_status: WARN
+        missing_iscsi_status: WARN
+        missing_iscsi_actual: "Not loaded or unavailable"
+        empty_data_path_actual: "Not mounted; acceptable before installation"
+
+    - name: Assert Longhorn worker and control-plane behavior
+      ansible.builtin.assert:
+        that:
+          - control_plane_longhorn_status == 'SKIP'
+          - valid_unmounted_disk_status == 'PASS'
+          - undersized_disk_status == 'FAIL'
+          - ambiguous_disk_status == 'WARN'
+          - missing_iscsi_status == 'WARN'
+          - missing_iscsi_actual != 'Loaded'
+          - empty_data_path_actual == 'Not mounted; acceptable before installation'
+
+    - name: Model verified versus unverified readiness evidence
+      ansible.builtin.set_fact:
+        verified_warning:
+          status: WARN
+          mandatory: true
+          applicable: true
+          verified: true
+          owner: Infrastructure
+          incomplete: false
+        unverified_requirement:
+          status: WARN
+          mandatory: true
+          applicable: true
+          verified: false
+          owner: Infrastructure
+          incomplete: true
+        optional_unverified:
+          status: SKIP
+          mandatory: false
+          applicable: false
+          verified: false
+          owner: Infrastructure
+          incomplete: false
+
+    - name: Assert readiness does not confuse warnings with incomplete evidence
+      ansible.builtin.assert:
+        that:
+          - not (verified_warning.incomplete | bool)
+          - unverified_requirement.incomplete | bool
+          - not (optional_unverified.incomplete | bool)
+
+    - name: Assert actionable findings preserve complete multiline text
+      ansible.builtin.set_fact:
+        long_remediation: "Remove or stop the verified incompatible Kubernetes runtime before RKE2 installation; preserve the complete service, PID, executable, and command-line evidence for remediation."
+
+    - name: Render complete multiline actionable finding
+      ansible.builtin.set_fact:
+        multiline_action: "FAIL — Infrastructure — Existing Kubernetes processes\nEvidence:\n  service: k3s\n  PID: 654\n  executable: /usr/bin/k3s\n  command line: /usr/bin/k3s server\nRemediation:\n  {{ long_remediation }}"
+
+    - name: Assert actionable evidence is not truncated
+      ansible.builtin.assert:
+        that:
+          - "long_remediation in multiline_action"
+          - "'PID: 654' in multiline_action"
+          - "'/usr/bin/k3s server' in multiline_action"

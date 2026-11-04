@@ -48,6 +48,8 @@ Do not add passwords or private keys to the inventory or any other tracked file.
 
 The validation supports Ubuntu 24.04 and Debian 13. Other Linux distributions receive a warning. It checks operating-system facts, x86_64 architecture, CPU, memory, root storage, networking, time synchronization, RKE2 kernel modules and parameters, Cilium eBPF prerequisites, Longhorn worker dependencies, and explicitly configured endpoints. Reports use six categories: `SYSTEM`, `STORAGE`, `NETWORK`, `RKE2`, `CILIUM`, and `LONGHORN`.
 
+Validation runs in `fresh_install` mode by default. In this mode, RKE2, Cilium, Longhorn, and Carekube-managed installation dependencies are not required to be present. Set `rke2_validation_mode: existing_install` when validating an already installed cluster.
+
 Requirements are mapped to the [RKE2 requirements](https://docs.rke2.io/install/requirements), [Cilium system requirements](https://docs.cilium.io/en/stable/operations/system_requirements/), and [Longhorn installation requirements](https://longhorn.io/docs/1.13.0/deploy/install/) documentation. Infrastructure provisioning is owned by Infrastructure; installation-managed modules, sysctls, packages, services, and CNI/storage setup are owned by Carekube.
 
 Requirements are configured in `vars/prerequisites.yml`. Disk requirements use decimal `GB`; Linux memory is displayed in binary `GiB`. Memory uses a configurable tolerance because Linux-visible memory can be slightly below provisioned VM memory due to kernel and firmware reservations. The playbook does not claim that provisioned memory was verified unless an independent source provides it.
@@ -70,6 +72,8 @@ Status meanings:
 - SKIP — not applicable, runtime-only before installation, or not configured.
 
 The overall result is `READY`, `INCOMPLETE`, or `NOT READY`. `INCOMPLETE` is used only for mandatory, applicable, Infrastructure-owned requirements whose evidence is unavailable or ambiguous. Carekube-managed installation tasks cannot produce `INCOMPLETE`. `NOT READY` is reserved for confirmed blockers, and the complete report is printed before the playbook returns nonzero.
+
+Runtime evidence includes exact service state, process ID, executable, and command line. A running `containerd` process alone is compatible with RKE2 and is not a conflict. Active but ambiguous runtime evidence is reported as a warning; only verified incompatible installations or an enabled clean-install policy can produce a runtime failure.
 
 Run locally with:
 

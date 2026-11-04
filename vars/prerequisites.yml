@@ -18,6 +18,18 @@ prerequisites_requirements:
     os_disk_gb: 100
     data_disk_gb: 2000
 
+# Validation mode controls whether post-install runtime requirements are
+# applicable. Fresh installation is intentionally non-blocking for components
+# that Carekube installs later.
+rke2_validation_mode: fresh_install
+rke2_allowed_validation_modes:
+  - fresh_install
+  - existing_install
+
+# A clean-install policy is opt-in. Runtime evidence alone is not enough to
+# fail a fresh-install validation.
+rke2_clean_install_policy: false
+
 # Linux-visible memory can be slightly lower than provisioned VM memory because
 # the kernel and firmware reserve memory. A value of 0.05 permits up to 5%
 # below the nominal requirement. This does not verify the hypervisor value.
