@@ -4,6 +4,8 @@
   connection: local
   gather_facts: false
   vars:
+    rke2_version: "v1.37.1+rke2r1"
+    rke2_artifact_base_url: https://github.com/rancher/rke2/releases/download
     rke2_bootstrap_node: cp-b
     rke2_api_endpoint: 192.0.2.10
     rke2_api_port: 6443
@@ -129,3 +131,47 @@
           - api-readiness
           - node-registration
           - extract-kubeconfig
+
+    - name: Derive fixed release artifact URLs
+      ansible.builtin.set_fact:
+        test_release_url: "{{ rke2_artifact_base_url }}/{{ rke2_version | replace('+', '%2B') }}"
+        test_tarball_url: "{{ rke2_artifact_base_url }}/{{ rke2_version | replace('+', '%2B') }}/rke2.linux-amd64.tar.gz"
+        test_checksum_url: "{{ rke2_artifact_base_url }}/{{ rke2_version | replace('+', '%2B') }}/sha256sum-amd64.txt"
+
+    - name: Assert the release is pinned to fixed Linux AMD64 artifacts
+      ansible.builtin.assert:
+        that:
+          - rke2_version == 'v1.37.1+rke2r1'
+          - "'%2B' in test_release_url"
+          - test_tarball_url is search('/rke2\\.linux-amd64\\.tar\\.gz$')
+          - test_checksum_url is search('/sha256sum-amd64\\.txt$')
+          - test_release_url is not search('/channels')
+
+    - name: Model sanitized installer diagnostics
+      ansible.builtin.set_fact:
+        installer_exit_code: 23
+        installer_raw_stderr: 'download failed token=super-secret password:other-secret'
+        installer_sanitized_stderr: "{{ 'download failed token=super-secret password:other-secret' | regex_replace('(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s]+', '\\1\\2[REDACTED]') | regex_replace('(?i)bearer\\s+[^\\s]+', 'Bearer [REDACTED]') }}"
+
+    - name: Assert installer diagnostics preserve failure context but redact secrets
+      ansible.builtin.assert:
+        that:
+          - installer_exit_code == 23
+          - "'[REDACTED]' in installer_sanitized_stderr"
+          - "'super-secret' not in installer_sanitized_stderr"
+          - "'other-secret' not in installer_sanitized_stderr"
+
+    - name: Model safe retry states after incomplete installation
+      ansible.builtin.set_fact:
+        binary_only_state: incomplete_install
+        cluster_data_state: unknown
+        retry_mutations: [install, configure, start]
+        forbidden_recovery_actions: [delete-data, uninstall, rotate-token]
+
+    - name: Assert incomplete installation is retryable without destructive recovery
+      ansible.builtin.assert:
+        that:
+          - binary_only_state == 'incomplete_install'
+          - cluster_data_state == 'unknown'
+          - retry_mutations | length == 3
+          - forbidden_recovery_actions | intersect(['delete-data', 'uninstall', 'rotate-token']) | length == 3

@@ -87,13 +87,14 @@
       ansible.builtin.set_fact:
         rke2_current_config: "{{ (rke2_existing_config.content | default('') | b64decode | from_yaml) if rke2_existing_config is defined and rke2_existing_config.content is defined else {} }}"
         rke2_installed_version: "{{ (rke2_version_command.stdout | default('') | regex_search('v[0-9]+\\.[0-9]+\\.[0-9]+[^ ]*')) | default('') }}"
-        rke2_has_installation: "{{ rke2_state_paths.results[0].stat.exists or rke2_state_paths.results[2].stat.exists }}"
+        rke2_has_binary: "{{ rke2_state_paths.results[0].stat.exists }}"
+        rke2_has_cluster_state: "{{ rke2_state_paths.results[1].stat.exists or rke2_state_paths.results[2].stat.exists }}"
       no_log: true
 
     - name: Determine managed configuration drift
       ansible.builtin.set_fact:
         rke2_config_drift: >-
-          {{ rke2_has_installation and (
+          {{ rke2_has_cluster_state and (
              (rke2_installed_version | length > 0 and rke2_installed_version != rke2_version) or
              (rke2_state_paths.results[3].stat.exists and
               (rke2_marker_content.content | b64decode | trim) != (rke2_expected_config | to_nice_json)) or
@@ -104,10 +105,58 @@
                ((rke2_current_config.get('tls-san', rke2_effective_sans) | sort) != (rke2_effective_sans | sort))))
              ) }}
         rke2_state: >-
-          {{ 'new' if not rke2_has_installation else
-             ('drifted' if rke2_config_drift else
-              ('matching' if rke2_state_paths.results[3].stat.exists else 'unknown')) }}
+          {{ 'new' if not rke2_has_binary and not rke2_has_cluster_state else
+             ('incomplete_install' if rke2_has_binary and not rke2_has_cluster_state else
+              ('drifted' if rke2_config_drift else
+               ('matching' if rke2_state_paths.results[3].stat.exists else 'unknown'))) }}
       no_log: true
+
+    - name: Derive fixed RKE2 Linux AMD64 artifact URLs
+      ansible.builtin.set_fact:
+        rke2_artifact_release_url: "{{ rke2_artifact_base_url }}/{{ rke2_version | replace('+', '%2B') }}"
+        rke2_tarball_url: "{{ rke2_artifact_base_url }}/{{ rke2_version | replace('+', '%2B') }}/rke2.linux-amd64.tar.gz"
+        rke2_checksum_url: "{{ rke2_artifact_base_url }}/{{ rke2_version | replace('+', '%2B') }}/sha256sum-amd64.txt"
+      when: rke2_state in ['new', 'incomplete_install']
+
+    - name: Probe pinned RKE2 checksum and tarball artifacts
+      ansible.builtin.uri:
+        url: "{{ item.url }}"
+        method: HEAD
+        follow_redirects: all
+        status_code: [200]
+        timeout: "{{ rke2_artifact_timeout }}"
+        return_content: false
+      loop:
+        - {name: checksum, url: "{{ rke2_checksum_url }}"}
+        - {name: Linux AMD64 tarball, url: "{{ rke2_tarball_url }}"}
+      loop_control:
+        label: "{{ item.name }}"
+      register: rke2_artifact_probes
+      changed_when: false
+      failed_when: false
+      when: rke2_state in ['new', 'incomplete_install']
+
+    - name: Report unavailable pinned RKE2 artifacts
+      ansible.builtin.debug:
+        msg: >-
+          RKE2 preflight failed for {{ item.item.name }}: HTTP status={{ item.status | default('unavailable') }},
+          URL={{ item.item.url }}. Verify the pinned release {{ rke2_version }} and network access before retrying.
+      loop: "{{ rke2_artifact_probes.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('artifact') }}"
+      when:
+        - rke2_state in ['new', 'incomplete_install']
+        - item.status | default(0) | int != 200
+
+    - name: Require pinned RKE2 artifacts before installation
+      ansible.builtin.assert:
+        that:
+          - rke2_artifact_probes.results | selectattr('status', 'equalto', 200) | list | length == 2
+        fail_msg: >-
+          Pinned RKE2 release {{ rke2_version }} is not fully accessible. Both the Linux AMD64
+          checksum and tarball must be reachable; no installation was attempted.
+      when:
+        - rke2_state in ['new', 'incomplete_install']
 
     - name: Refuse unsafe existing state before mutation
       ansible.builtin.assert:
@@ -134,7 +183,7 @@
         mode: '0700'
       when:
         - inventory_hostname == rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
 
     - name: Install RKE2 server on a new bootstrap
@@ -149,9 +198,51 @@
         INSTALL_RKE2_TYPE: server
       when:
         - inventory_hostname == rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
+      register: rke2_bootstrap_install_result
+      changed_when: rke2_bootstrap_install_result.rc == 0
+      failed_when: false
+
+    - name: Sanitize failed bootstrap installer diagnostics
+      ansible.builtin.set_fact:
+        rke2_bootstrap_install_stdout: >-
+          {{ rke2_bootstrap_install_result.stdout | default('')
+             | regex_replace('(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s]+', '\\1\\2[REDACTED]')
+             | regex_replace('(?i)bearer\\s+[^\\s]+', 'Bearer [REDACTED]')
+             | truncate(rke2_installer_diagnostic_limit | int, true, '...') }}
+        rke2_bootstrap_install_stderr: >-
+          {{ rke2_bootstrap_install_result.stderr | default('')
+             | regex_replace('(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s]+', '\\1\\2[REDACTED]')
+             | regex_replace('(?i)bearer\\s+[^\\s]+', 'Bearer [REDACTED]')
+             | truncate(rke2_installer_diagnostic_limit | int, true, '...') }}
       no_log: true
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_bootstrap_install_result.rc != 0
+
+    - name: Report failed bootstrap installer diagnostics
+      ansible.builtin.debug:
+        msg:
+          exit_code: "{{ rke2_bootstrap_install_result.rc }}"
+          stdout: "{{ rke2_bootstrap_install_stdout | default('[empty]') }}"
+          stderr: "{{ rke2_bootstrap_install_stderr | default('[empty]') }}"
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_bootstrap_install_result.rc != 0
+
+    - name: Stop after failed bootstrap installation
+      ansible.builtin.fail:
+        msg: "RKE2 bootstrap installer failed with exit code {{ rke2_bootstrap_install_result.rc }}; see sanitized diagnostics above."
+      when:
+        - inventory_hostname == rke2_bootstrap_node
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_bootstrap_install_result.rc != 0
 
     - name: Configure a new embedded-etcd bootstrap server
       ansible.builtin.copy:
@@ -170,7 +261,7 @@
           {% endif %}
       when:
         - inventory_hostname == rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
       no_log: true
       register: rke2_bootstrap_config
@@ -182,7 +273,7 @@
         enabled: true
       when:
         - inventory_hostname == rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
 
     - name: Wait for the bootstrap token
@@ -193,7 +284,7 @@
         executable: /bin/bash
       when:
         - inventory_hostname == rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
       register: rke2_token_wait
       retries: 60
@@ -211,7 +302,7 @@
         mode: '0600'
       when:
         - inventory_hostname == rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
       no_log: true
 
@@ -288,9 +379,43 @@
         INSTALL_RKE2_TYPE: server
       when:
         - inventory_hostname != rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
+      register: rke2_control_plane_install_result
+      changed_when: rke2_control_plane_install_result.rc == 0
+      failed_when: false
+
+    - name: Sanitize failed control-plane installer diagnostics
+      ansible.builtin.set_fact:
+        rke2_control_plane_install_stdout: "{{ rke2_control_plane_install_result.stdout | default('') | regex_replace('(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s]+', '\\1\\2[REDACTED]') | regex_replace('(?i)bearer\\s+[^\\s]+', 'Bearer [REDACTED]') | truncate(rke2_installer_diagnostic_limit | int, true, '...') }}"
+        rke2_control_plane_install_stderr: "{{ rke2_control_plane_install_result.stderr | default('') | regex_replace('(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s]+', '\\1\\2[REDACTED]') | regex_replace('(?i)bearer\\s+[^\\s]+', 'Bearer [REDACTED]') | truncate(rke2_installer_diagnostic_limit | int, true, '...') }}"
       no_log: true
+      when:
+        - inventory_hostname != rke2_bootstrap_node
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_control_plane_install_result.rc != 0
+
+    - name: Report failed control-plane installer diagnostics
+      ansible.builtin.debug:
+        msg:
+          exit_code: "{{ rke2_control_plane_install_result.rc }}"
+          stdout: "{{ rke2_control_plane_install_stdout | default('[empty]') }}"
+          stderr: "{{ rke2_control_plane_install_stderr | default('[empty]') }}"
+      when:
+        - inventory_hostname != rke2_bootstrap_node
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_control_plane_install_result.rc != 0
+
+    - name: Stop after failed control-plane installation
+      ansible.builtin.fail:
+        msg: "RKE2 control-plane installer failed with exit code {{ rke2_control_plane_install_result.rc }}; see sanitized diagnostics above."
+      when:
+        - inventory_hostname != rke2_bootstrap_node
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_control_plane_install_result.rc != 0
 
     - name: Configure a new joining control-plane node
       ansible.builtin.copy:
@@ -309,7 +434,7 @@
           {% endfor %}
       when:
         - inventory_hostname != rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
       no_log: true
 
@@ -320,7 +445,7 @@
         enabled: true
       when:
         - inventory_hostname != rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
 
     - name: Record managed joining control-plane configuration
@@ -332,7 +457,7 @@
         mode: '0600'
       when:
         - inventory_hostname != rke2_bootstrap_node
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
       no_log: true
 
@@ -354,9 +479,40 @@
       environment:
         INSTALL_RKE2_VERSION: "{{ rke2_version }}"
         INSTALL_RKE2_TYPE: agent
+      register: rke2_worker_install_result
+      changed_when: rke2_worker_install_result.rc == 0
+      failed_when: false
+
+    - name: Sanitize failed worker installer diagnostics
+      ansible.builtin.set_fact:
+        rke2_worker_install_stdout: "{{ rke2_worker_install_result.stdout | default('') | regex_replace('(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s]+', '\\1\\2[REDACTED]') | regex_replace('(?i)bearer\\s+[^\\s]+', 'Bearer [REDACTED]') | truncate(rke2_installer_diagnostic_limit | int, true, '...') }}"
+        rke2_worker_install_stderr: "{{ rke2_worker_install_result.stderr | default('') | regex_replace('(?i)(token|password|secret|authorization)(\\s*[:=]\\s*)[^\\s]+', '\\1\\2[REDACTED]') | regex_replace('(?i)bearer\\s+[^\\s]+', 'Bearer [REDACTED]') | truncate(rke2_installer_diagnostic_limit | int, true, '...') }}"
       no_log: true
       when:
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_worker_install_result.rc != 0
+
+    - name: Report failed worker installer diagnostics
+      ansible.builtin.debug:
+        msg:
+          exit_code: "{{ rke2_worker_install_result.rc }}"
+          stdout: "{{ rke2_worker_install_stdout | default('[empty]') }}"
+          stderr: "{{ rke2_worker_install_stderr | default('[empty]') }}"
+      when:
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_worker_install_result.rc != 0
+
+    - name: Stop after failed worker installation
+      ansible.builtin.fail:
+        msg: "RKE2 worker installer failed with exit code {{ rke2_worker_install_result.rc }}; see sanitized diagnostics above."
+      when:
+        - rke2_state in ['new', 'incomplete_install']
+        - not ansible_check_mode
+        - rke2_worker_install_result.rc != 0
+      when:
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
 
     - name: Configure a new worker agent
@@ -370,7 +526,7 @@
           token: {{ hostvars['localhost']['rke2_cluster_token'] }}
       no_log: true
       when:
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
 
     - name: Start a new worker agent
@@ -379,7 +535,7 @@
         state: started
         enabled: true
       when:
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
 
     - name: Record managed worker configuration
@@ -391,7 +547,7 @@
         mode: '0600'
       no_log: true
       when:
-        - rke2_state == 'new'
+        - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
 
 - name: Verify API and extract kubeconfig
@@ -497,7 +653,7 @@
           state={{ rke2_state }} |
           action={{
             ('WOULD INITIALIZE' if inventory_hostname == rke2_bootstrap_node else 'WOULD JOIN')
-            if ansible_check_mode and rke2_state == 'new' else
+            if ansible_check_mode and rke2_state in ['new', 'incomplete_install'] else
             ('WOULD PRESERVE' if ansible_check_mode and rke2_state == 'matching' else
             ('DRIFT DETECTED' if rke2_state == 'drifted' else
             ('UNSAFE STATE' if rke2_state == 'unknown' else
