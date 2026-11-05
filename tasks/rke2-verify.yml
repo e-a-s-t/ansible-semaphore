@@ -1,0 +1,69 @@
+---
+- name: Build expected Kubernetes node identities
+  ansible.builtin.set_fact:
+    rke2_expected_nodes: "{{ (groups['control_plane'] + groups['worker']) | map('extract', hostvars, 'rke2_node_name') | list }}"
+
+- name: Require unique Kubernetes node identities
+  ansible.builtin.assert:
+    that:
+      - rke2_expected_nodes | unique | length == rke2_expected_nodes | length
+      - rke2_expected_nodes | select('match', '^[a-z0-9][a-z0-9.-]*$') | list | length == rke2_expected_nodes | length
+    fail_msg: Configure unique rke2_node_name values for every inventory node.
+
+- name: Verify registered Kubernetes nodes from a healthy control-plane member
+  ansible.builtin.command:
+    argv:
+      - /var/lib/rancher/rke2/bin/kubectl
+      - --kubeconfig
+      - /etc/rancher/rke2/rke2.yaml
+      - get
+      - nodes
+      - -o
+      - json
+  register: rke2_registered_nodes
+  changed_when: false
+  failed_when: false
+  no_log: true
+  retries: "{{ rke2_api_wait_retries }}"
+  delay: "{{ rke2_api_wait_delay }}"
+  until: (rke2_registered_nodes | verify_rke2_nodes(rke2_expected_nodes, rke2_version)).ok
+  ignore_errors: true
+
+- name: Produce allowlisted verification diagnostics
+  ansible.builtin.set_fact:
+    rke2_verification: "{{ rke2_registered_nodes | verify_rke2_nodes(rke2_expected_nodes, rke2_version) }}"
+  no_log: true
+
+- name: Require expected Ready nodes and pinned Kubernetes version
+  ansible.builtin.assert:
+    that: rke2_verification.ok
+    fail_msg: "Kubernetes verification failed: {{ rke2_verification }}"
+
+- name: Read admin kubeconfig from the selected healthy control-plane member
+  ansible.builtin.slurp:
+    src: /etc/rancher/rke2/rke2.yaml
+  register: rke2_kubeconfig_source
+  no_log: true
+
+- name: Create protected kubeconfig directory
+  ansible.builtin.file:
+    path: "{{ rke2_kubeconfig_path | dirname }}"
+    state: directory
+    mode: '0700'
+  delegate_to: localhost
+  become: false
+  when: not ansible_check_mode
+
+- name: Extract kubeconfig with external API endpoint
+  ansible.builtin.copy:
+    content: >-
+      {{ (rke2_kubeconfig_source.content | b64decode)
+         | regex_replace('https://127[.]0[.]0[.]1:[0-9]+', 'https://' ~ rke2_api_endpoint ~ ':' ~ (rke2_api_port | string))
+         | regex_replace('https://localhost:[0-9]+', 'https://' ~ rke2_api_endpoint ~ ':' ~ (rke2_api_port | string)) }}
+    dest: "{{ rke2_kubeconfig_path }}"
+    mode: '0600'
+  no_log: true
+  delegate_to: localhost
+  become: false
+  when: not ansible_check_mode
+

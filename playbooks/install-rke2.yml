@@ -36,6 +36,17 @@
           - rke2_registration_port | int > 0
           - rke2_cni == 'cilium'
 
+    - name: Discover Kubernetes node name when inventory has no explicit mapping
+      ansible.builtin.command: hostname
+      register: rke2_hostname
+      changed_when: false
+      check_mode: false
+      when: rke2_node_name is not defined
+
+    - name: Record Kubernetes node identity
+      ansible.builtin.set_fact:
+        rke2_node_name: "{{ rke2_node_name | default(rke2_hostname.stdout | default(inventory_hostname) | lower) }}"
+
     - name: Inspect local RKE2 state
       ansible.builtin.stat:
         path: "{{ item }}"
@@ -81,6 +92,7 @@
         rke2_expected_config: >-
           {{ ({
             'cni': rke2_cni,
+            'ingress-controller': rke2_ingress_controller,
             'disable': rke2_disabled_components,
             'tls-san': ([rke2_api_endpoint] + (rke2_tls_sans | default([]))) | unique
           }
@@ -261,6 +273,7 @@
         content: |
           cluster-init: true
           cni: {{ rke2_cni }}
+          ingress-controller: {{ rke2_ingress_controller }}
           disable:
           {% for component in rke2_disabled_components %}  - {{ component }}
           {% endfor %}tls-san:
@@ -411,6 +424,7 @@
           server: https://{{ rke2_registration_endpoint }}:{{ rke2_registration_port }}
           token: {{ hostvars['localhost']['rke2_cluster_token'] }}
           cni: {{ rke2_cni }}
+          ingress-controller: {{ rke2_ingress_controller }}
           disable:
           {% for component in rke2_disabled_components %}  - {{ component }}
           {% endfor %}tls-san:
@@ -562,11 +576,10 @@
       when: not ansible_check_mode
 
 - name: Verify API and extract kubeconfig
-  hosts: localhost
-  connection: local
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) | intersect([hostvars['localhost'].rke2_selected_source | default('')]) }}"
   gather_facts: false
   strategy: linear
-  become: false
+  become: true
   vars_files:
     - ../vars/rke2.yml
   tasks:
@@ -574,84 +587,9 @@
       ansible.builtin.include_tasks: ../tasks/rke2-verification-barrier.yml
       when: not ansible_check_mode
 
-    - name: Wait for the Kubernetes API endpoint
-      ansible.builtin.uri:
-        url: "https://{{ rke2_api_endpoint }}:{{ rke2_api_port }}/version"
-        method: GET
-        validate_certs: false
-        status_code: [200, 401, 403]
-      register: rke2_api_check
-      retries: "{{ rke2_api_wait_retries }}"
-      delay: "{{ rke2_api_wait_delay }}"
-      until: rke2_api_check.status in [200, 401, 403]
+    - name: Verify nodes and extract protected kubeconfig
+      ansible.builtin.include_tasks: ../tasks/rke2-verify.yml
       when: not ansible_check_mode
-
-    - name: Verify registered Kubernetes nodes from a healthy control-plane member
-      become: true
-      ansible.builtin.command: >-
-        /usr/local/bin/rke2 kubectl
-        --kubeconfig /etc/rancher/rke2/rke2.yaml
-        get nodes --no-headers
-      delegate_to: "{{ rke2_token_source_node | trim if rke2_token_source_node | trim else rke2_bootstrap_node }}"
-      register: rke2_registered_nodes
-      changed_when: false
-      no_log: true
-      failed_when: rke2_registered_nodes.rc != 0
-      when: not ansible_check_mode
-
-    - name: Require all inventory nodes to be represented in the API
-      ansible.builtin.assert:
-        that:
-          - (rke2_registered_nodes.stdout_lines | length) >= (groups['control_plane'] | length + groups['worker'] | length)
-        fail_msg: "The Kubernetes API did not report all expected control-plane and worker nodes."
-      no_log: true
-      when: not ansible_check_mode
-
-    - name: Read admin kubeconfig from the selected healthy control-plane member
-      become: true
-      ansible.builtin.slurp:
-        src: /etc/rancher/rke2/rke2.yaml
-      delegate_to: "{{ rke2_token_source_node | trim if rke2_token_source_node | trim else rke2_bootstrap_node }}"
-      register: rke2_kubeconfig_source
-      no_log: true
-      when: not ansible_check_mode
-
-    - name: Create protected kubeconfig directory
-      ansible.builtin.file:
-        path: "{{ rke2_kubeconfig_path | dirname }}"
-        state: directory
-        mode: '0700'
-      when: not ansible_check_mode
-
-    - name: Extract kubeconfig with external API endpoint
-      ansible.builtin.copy:
-        content: >-
-          {{ (rke2_kubeconfig_source.content | b64decode)
-             | regex_replace('https://127\\.0\\.0\\.1:[0-9]+', 'https://' ~ rke2_api_endpoint ~ ':' ~ (rke2_api_port | string))
-             | regex_replace('https://localhost:[0-9]+', 'https://' ~ rke2_api_endpoint ~ ':' ~ (rke2_api_port | string)) }}
-        dest: "{{ rke2_kubeconfig_path }}"
-        mode: '0600'
-      no_log: true
-      when: not ansible_check_mode
-
-    - name: Report installation completion without secrets
-      ansible.builtin.debug:
-        msg: |
-          RKE2 INSTALLATION — COMPLETE
-          Bootstrap node: {{ rke2_bootstrap_node }}
-          API endpoint: {{ rke2_api_endpoint }}:{{ rke2_api_port }}
-          Registration endpoint: {{ rke2_registration_endpoint }}:{{ rke2_registration_port }}
-          CNI: {{ rke2_cni }}
-          Kubeconfig: {{ rke2_kubeconfig_path }} (0600)
-          Token: preserved and backed up outside the cluster
-      when: not ansible_check_mode
-
-    - name: Report check-mode validation without claiming installation
-      ansible.builtin.debug:
-        msg: >-
-          RKE2 CHECK MODE — validation only; no installation, service changes,
-          token retrieval, readiness checks, or kubeconfig extraction performed.
-      when: ansible_check_mode
 
 - name: Report per-node RKE2 installation state
   hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) }}"

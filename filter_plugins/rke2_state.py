@@ -34,12 +34,16 @@ def classify_rke2(paths, version_result, config_result, marker_result, expected,
         differences = []
         if binary and installed != version:
             differences.append('version')
+        if not control_plane:
+            expected = {k: v for k, v in expected.items() if k != 'ingress-controller'}
+            if marker_exists:
+                marker.pop('ingress-controller', None)
         if marker_exists:
             # Existing markers also carry server-only defaults for workers.
-            if set(marker) != set(expected):
+            if set(marker) | ({'ingress-controller'} if 'ingress-controller' in expected else set()) != set(expected):
                 differences.append('marker')
             for key in expected:
-                a, b = marker.get(key), expected[key]
+                a, b = marker.get(key, 'traefik' if key == 'ingress-controller' else None), expected[key]
                 if key in ('disable', 'tls-san') and isinstance(a, list):
                     a, b = sorted(a), sorted(b)
                 if a != b:
@@ -48,8 +52,10 @@ def classify_rke2(paths, version_result, config_result, marker_result, expected,
             keys = ['cluster-init'] if bootstrap else ['server']
             if control_plane:
                 keys += ['cni', 'disable', 'tls-san']
+                if 'ingress-controller' in expected:
+                    keys += ['ingress-controller']
             for key in keys:
-                a, b = current.get(key), expected[key]
+                a, b = current.get(key, 'traefik' if key == 'ingress-controller' else None), expected[key]
                 if key in ('disable', 'tls-san') and isinstance(a, list):
                     a, b = sorted(a), sorted(b)
                 if a != b:
@@ -66,6 +72,31 @@ def classify_rke2(paths, version_result, config_result, marker_result, expected,
         return dict(state='inspection_error', drift=False, differences=[], inspection_error=True, error_category=stage)
 
 
+def verify_rke2_nodes(result, expected, version):
+    # Never return command output, API metadata, exception text or credentials.
+    failure = dict(ok=False, category='command_failed', missing=[], not_ready=[], version_mismatch=[])
+    if result.get('rc', 1) != 0:
+        return failure
+    try:
+        items = json.loads(result['stdout'])['items']
+        nodes = {n['metadata']['name']: n for n in items}
+        missing, not_ready, mismatch = [], [], []
+        for name in expected:
+            if name not in nodes:
+                missing.append(name)
+                continue
+            node = nodes[name]
+            if not any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                       for c in node['status'].get('conditions', [])):
+                not_ready.append(name)
+            if node['status']['nodeInfo']['kubeletVersion'] != version:
+                mismatch.append(name)
+        return dict(ok=not (missing or not_ready or mismatch), category='node_status',
+                    missing=missing, not_ready=not_ready, version_mismatch=mismatch)
+    except Exception:
+        return dict(failure, category='invalid_node_response')
+
+
 class FilterModule:
     def filters(self):
-        return {'classify_rke2': classify_rke2}
+        return {'classify_rke2': classify_rke2, 'verify_rke2_nodes': verify_rke2_nodes}

@@ -124,7 +124,7 @@ The first fresh server uses `cluster-init: true`. Joining control-plane nodes ne
 
 RKE2 generates the server token during a fresh bootstrap unless `rke2_join_token` is explicitly supplied. Existing-cluster expansion reads the existing token from `rke2_token_source_node`, or the bootstrap node by default. The playbook never rotates or regenerates an existing token. It stores a protected `0600` recovery copy on the Ansible controller; include that file in encrypted disaster-recovery backups and do not commit it.
 
-The playbook configures RKE2-managed Cilium and disables bundled `rke2-ingress-nginx`. It extracts the admin kubeconfig to `rke2_kubeconfig_path`, replaces the localhost API address with the configured API endpoint, and writes it with mode `0600`. Token and kubeconfig operations use hidden task logging.
+The playbook configures RKE2-managed Cilium and selects `ingress-controller: none` to disable bundled ingress. It extracts the admin kubeconfig to `rke2_kubeconfig_path`, replaces the localhost API address with the configured API endpoint, and writes it with mode `0600`. Token and kubeconfig operations use hidden task logging.
 
 Run the installation template with:
 
@@ -254,3 +254,62 @@ Token backups retain their configured persistent destination, directory mode
 API verification and kubeconfig extraction require current-run bootstrap and token
 readiness plus successful completion of every targeted node. Failures block those
 operations even if Ansible continues into later plays.
+
+### RKE2 final verification and ingress migration
+
+Fresh v1.37 installations retain Cilium, CoreDNS, metrics-server, the snapshot
+components and the standalone `rke2-gateway-api-crd` chart. All managed servers
+use `ingress-controller: none`; no ingress or gateway implementation is installed
+by this playbook. Disabling only `rke2-ingress-nginx` does not disable the v1.37
+Traefik default. See the [RKE2 networking documentation](https://docs.rke2.io/networking/networking_services)
+and [server configuration reference](https://docs.rke2.io/reference/server_config).
+
+Final verification runs directly as root on the selected inventory control-plane
+host, retaining that host's SSH settings. `rke2_token_source_node` selects an
+alternative healthy control plane (include it in the host limit). The API JSON
+must contain every inventory node, Ready, at exactly `rke2_version`; extra nodes
+do not substitute for missing nodes. Set `rke2_node_name` for aliases or custom
+node names. Otherwise the remote hostname is used. The lab mappings are
+`basel-rke2-1` → `basel-rke2-01` and `basel-rke2-2` → `basel-rke2-02`.
+Retries allow registration to converge. Failure diagnostics report only expected
+node identities and failure categories, never raw command output or credentials.
+Check mode skips final verification and extraction.
+
+Inspect nodes on a control plane with:
+
+```bash
+sudo /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml get nodes -o json
+```
+
+The admin kubeconfig is read there with hidden logging and saved on the Semaphore
+controller as the Semaphore process user at `rke2_kubeconfig_path` (default
+`$HOME/.kube/carekube-rke2.yaml`), mode `0600`, parent directory `0700`.
+Its loopback server address is replaced by the configured API endpoint. Repeated
+extraction of unchanged content makes no change.
+
+Existing installations are never migrated automatically. The new ingress setting
+is drift: the playbook stops before mutation. To finish verification of the
+existing Traefik installation first, explicitly use the temporary extra variable
+`rke2_ingress_controller: traefik`. Legacy configuration and markers without an
+explicit ingress setting are interpreted as the v1.37 Traefik default. This
+preserves their contents, token, binary and healthy services.
+
+For a controlled migration, schedule a maintenance window (the lab has only one
+control plane), back up etcd and securely back up configuration, token, kubeconfig,
+and Gateway API resources. Inspect installed HelmCharts and Gateway API CRD
+ownership first; ensure `rke2-gateway-api-crd` owns the required CRDs before removing
+Traefik. v1.37 separates these CRDs from Traefik; do not delete Gateway API CRDs
+or the standalone chart. Review any workloads depending on Traefik.
+
+Manually add `ingress-controller: none` to each server's existing
+`/etc/rancher/rke2/config.yaml`, preserving every other setting, especially tokens,
+Cilium, SANs and cluster identity. Restart `rke2-server` on one server at a time,
+waiting for healthy API/etcd and Ready nodes between servers. Confirm the bundled
+Traefik charts and workloads are removed and Gateway API CRDs remain. Do not
+restart workers or delete cluster data. If validation fails, restore the prior
+server configuration and restart that server during the window.
+
+After successful migration, securely update only the `ingress-controller` field
+to `none` in each existing `.carekube-managed-config` JSON marker. Remove the
+temporary extra variable and rerun the playbook. All other differences still
+require review; do not bypass drift checks or recreate markers blindly.

@@ -13,6 +13,8 @@ rke2_registration_port: 9345
 rke2_tls_sans: []
 
 rke2_cni: cilium
+# v1.37: retain the standalone Gateway API CRD chart, deploy no ingress.
+rke2_ingress_controller: none
 rke2_disabled_components:
   - rke2-ingress-nginx
 rke2_config_path: /etc/rancher/rke2/config.yaml
