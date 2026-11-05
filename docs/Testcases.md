@@ -259,3 +259,15 @@ Expected result: Probe failures are classified correctly; handshake success is n
 Status: Missing
 
 Evidence / coverage boundary: No dedicated automated endpoint/live platform integration tests exist.
+
+### TC-022
+
+Title: Direct per-target RKE2 service verification and reporting
+
+Production service inspection and report tasks are exercised by
+[service regressions](../tests/test_rke2_service.py). Coverage includes exact
+server/agent selection despite stale service facts, startup retries, persistent
+inactive or disabled units, missing units/properties, inspection errors,
+check-mode observation, and failure blocking subsequent API/kubeconfig work.
+Matching nodes receive only read-only service queries; no start, enable, restart,
+configuration write, or installation operation is added. Fixtures never contact VMs.

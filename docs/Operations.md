@@ -10,7 +10,7 @@ Run the four setup stages described in Usage. Targets need SSH, Python, apt repo
 
 Use Ansible/Semaphore task logs and recaps for per-host failures and readiness reports. There is no repository-managed monitoring stack, dashboard, alerting, or HTTP health endpoint. Installation checks registered Kubernetes node readiness/version and reads kubeconfig on the selected control plane. It does not establish full Cilium, storage, workload, or disaster-recovery health.
 
-On a server, inspect `sudo systemctl status rke2-server` and `sudo journalctl -u rke2-server`; on a worker use `rke2-agent`. Treat service logs as potentially sensitive. A matching configuration is preserved even when its service is stopped; investigate service health rather than expecting a rerun to restart it.
+On a server, inspect `sudo systemctl status rke2-server` and `sudo journalctl -u rke2-server`; on a worker use `rke2-agent`. Treat service logs as potentially sensitive. A matching configuration is preserved even when its service is stopped. Final verification directly queries the expected systemd unit on every targeted node and requires `LoadState=loaded`, `ActiveState=active`, and `UnitFileState=enabled`, using the bounded final-verification retry settings. Failure blocks Kubernetes verification and kubeconfig extraction; investigate service health rather than expecting a rerun to restart or enable a preserved service. Reports use these independently observed properties, not cached service facts or a fallback to the other role's unit. Check mode observes once without enforcing readiness.
 
 ## Backups and upgrades
 

@@ -1,0 +1,57 @@
+---
+- name: Select this target's expected RKE2 systemd unit
+  ansible.builtin.set_fact:
+    rke2_service_unit: "{{ 'rke2-server.service' if 'control_plane' in group_names else 'rke2-agent.service' }}"
+
+- name: Inspect expected RKE2 service directly on this target
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - "{{ rke2_service_unit }}"
+      - --property=LoadState,ActiveState,UnitFileState
+      - --no-pager
+  register: rke2_service_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+  retries: "{{ 0 if ansible_check_mode else rke2_api_wait_retries }}"
+  delay: "{{ rke2_api_wait_delay }}"
+  until: >-
+    ansible_check_mode or
+    (rke2_service_probe.rc | default(-1) == 0
+     and 'LoadState=loaded' in rke2_service_probe.stdout_lines | default([])
+     and 'ActiveState=active' in rke2_service_probe.stdout_lines | default([])
+     and 'UnitFileState=enabled' in rke2_service_probe.stdout_lines | default([]))
+  ignore_errors: true
+
+- name: Record only allowlisted independently observed service properties
+  ansible.builtin.set_fact:
+    rke2_verified_service:
+      unit: "{{ rke2_service_unit }}"
+      load: >-
+        {{ rke2_service_probe.stdout_lines | default([])
+           | select('match', '^LoadState=(loaded|not-found|masked|error|bad-setting)$')
+           | map('regex_replace', '^LoadState=', '') | first | default('unknown') }}
+      active: >-
+        {{ rke2_service_probe.stdout_lines | default([])
+           | select('match', '^ActiveState=(active|inactive|activating|deactivating|failed|reloading|maintenance|refreshing)$')
+           | map('regex_replace', '^ActiveState=', '') | first | default('unknown') }}
+      enabled: >-
+        {{ rke2_service_probe.stdout_lines | default([])
+           | select('match', '^UnitFileState=(enabled|enabled-runtime|disabled|static|masked|masked-runtime|indirect|generated|transient|linked|linked-runtime|alias|not-found|bad)$')
+           | map('regex_replace', '^UnitFileState=', '') | first | default('unknown') }}
+
+- name: Require this target's RKE2 service to be active and persistently enabled
+  ansible.builtin.assert:
+    that:
+      - rke2_service_probe.rc | default(-1) == 0
+      - rke2_verified_service.load == 'loaded'
+      - rke2_verified_service.active == 'active'
+      - rke2_verified_service.enabled == 'enabled'
+    fail_msg: >-
+      RKE2 service verification failed on {{ inventory_hostname }}:
+      {{ rke2_verified_service }}. Expected loaded, active, enabled;
+      preserved installations are not automatically restarted or enabled.
+  when: not ansible_check_mode

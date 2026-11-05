@@ -37,8 +37,8 @@ Source: [vars/rke2.yml](../vars/rke2.yml). All entries have defaults, but enviro
 | `rke2_artifact_base_url` | `https://github.com/rancher/rke2/releases/download` | Base for preflight artifact HEAD probes; does not redirect the installer download source. |
 | `rke2_artifact_timeout` | `20` | Seconds per preflight HEAD request. |
 | `rke2_installer_diagnostic_limit` | `4000` | Maximum displayed installer stdout/stderr length after redaction. |
-| `rke2_api_wait_retries` | `60` | Final node verification retry setting; bootstrap token wait is separately fixed at 60 retries. |
-| `rke2_api_wait_delay` | `5` | Final verification retry delay in seconds; bootstrap token wait uses a fixed 5 seconds. |
+| `rke2_api_wait_retries` | `60` | Final per-target systemd service and Kubernetes node verification retry setting; bootstrap token wait is separately fixed at 60 retries. |
+| `rke2_api_wait_delay` | `5` | Final service and Kubernetes verification retry delay in seconds; bootstrap token wait uses a fixed 5 seconds. |
 | `rke2_controller_remote_tmp` | `/tmp/ansible-semaphore-{{ lookup('pipe', 'id -u') }}/remote` | Controller-only staging directory, mode 0700; evaluated with controller uid. |
 | `rke2_remove_confirm` | `false` | Only native true or case-insensitive string true authorizes; no whitespace trimming. |
 | `rke2_remove_cleanup_attempts` | `3` | Positive integer, excluding booleans; official cleanup attempts only. |

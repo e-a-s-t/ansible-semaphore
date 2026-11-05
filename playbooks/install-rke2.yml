@@ -575,6 +575,22 @@
         rke2_installation_complete: true
       when: not ansible_check_mode
 
+- name: Independently verify RKE2 services on every targeted node
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) }}"
+  gather_facts: false
+  strategy: linear
+  any_errors_fatal: true
+  become: true
+  vars_files:
+    - ../vars/rke2.yml
+  tasks:
+    - name: Enforce installation prerequisites before service verification
+      ansible.builtin.include_tasks: ../tasks/rke2-verification-barrier.yml
+      when: not ansible_check_mode
+
+    - name: Verify or observe each target's expected service
+      ansible.builtin.include_tasks: ../tasks/rke2-service-verify.yml
+
 - name: Verify API and extract kubeconfig
   hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) | intersect([hostvars['localhost'].rke2_selected_source | default('')]) }}"
   gather_facts: false
@@ -599,9 +615,6 @@
   vars_files:
     - ../vars/rke2.yml
   tasks:
-    - name: Gather RKE2 service state
-      ansible.builtin.service_facts:
-
     - name: Report node installation result without secrets
       ansible.builtin.debug:
         msg: >-
@@ -615,5 +628,5 @@
             ('DRIFT DETECTED' if rke2_state == 'drifted' else
             ('UNSAFE STATE' if rke2_state == 'unknown' else
             ('preserved' if rke2_state == 'matching' else 'installed/joined')))) }} |
-          service={{ ('rke2-server.service' if 'control_plane' in group_names else 'rke2-agent.service') }}={{
-            ansible_facts.services.get('rke2-server.service', ansible_facts.services.get('rke2-agent.service', {})).state | default('unknown') }}
+          service={{ rke2_verified_service.unit }}={{ rke2_verified_service.active }} |
+          enabled={{ rke2_verified_service.enabled }}
