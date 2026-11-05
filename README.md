@@ -200,6 +200,13 @@ Never commit either private key, passwords, or other credentials.
 
 ### RKE2 rerun safety and offline regression checks
 
+RKE2 targets are captured once, before controller setup or delegation, from the
+`control_plane` and `worker` inventory groups intersected with the initial host
+selection (including Semaphore's host limit). Localhost aliases and controller-only
+hosts are excluded. Later inventory additions and failed hosts never change this
+snapshot: every originally targeted node must complete preflight. Bootstrap and
+token-source dependencies are validated separately without expanding the targets.
+
 Every targeted RKE2 host must pass classification and drift validation before
 any node can be installed, configured, or started. A failed or unreachable host
 continues to block the cluster-wide barrier even after Ansible removes it from

@@ -147,7 +147,7 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(defaults['rke2_controller_remote_tmp'].startswith('/tmp/'))
         plays = yaml.safe_load((ROOT / 'playbooks/install-rke2.yml').read_text())
         self.assertEqual(plays[0]['pre_tasks'][0]['ansible.builtin.include_tasks'],
-                         '../tasks/rke2-controller.yml')
+                         '../tasks/rke2-initialize.yml')
         final = next(p for p in plays if p['name'] == 'Verify API and extract kubeconfig')
         self.assertEqual(final['tasks'][0]['ansible.builtin.include_tasks'],
                          '../tasks/rke2-verification-barrier.yml')

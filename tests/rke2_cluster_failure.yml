@@ -1,16 +1,27 @@
 ---
 - name: Simulate a host lost during preflight
-  hosts: control_plane:worker
+  hosts: "{{ (groups['control_plane'] | default([]) | union(groups['worker'] | default([]))) | difference(['localhost', '127.0.0.1', '::1']) }}"
   connection: local
   gather_facts: false
+  vars:
+    rke2_bootstrap_node: cp
+    rke2_token_source_node: ""
+    rke2_controller_remote_tmp: "{{ fixture_tmp }}/remote"
   tasks:
-    - ansible.builtin.set_fact:
-        rke2_target_hosts: "{{ ansible_play_hosts_all }}"
-        rke2_selected_source: cp
-        rke2_source_ready: false
-        rke2_token_ready: false
+    - ansible.builtin.include_tasks: ../tasks/rke2-initialize.yml
+    - name: Controller delegation must preserve the original node list
+      ansible.builtin.assert:
+        that:
+          - hostvars['localhost'].rke2_target_hosts == expected_targets
+          - hostvars['localhost'].rke2_preflight_ready is not defined
+          - hostvars['controller'].rke2_preflight_ready is not defined
+          - not (hostvars[inventory_hostname].rke2_preflight_ready | bool)
       delegate_to: localhost
-      delegate_facts: true
+    - name: Add a late inventory node after target capture
+      ansible.builtin.add_host:
+        name: late-worker
+        groups: worker
+        ansible_connection: local
       run_once: true
     - name: Inject classification failure
       ansible.builtin.fail:
@@ -20,14 +31,19 @@
         rke2_preflight_ready: true
 
 - name: Attempt mutation in a subsequent play
-  hosts: control_plane:worker
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) }}"
   connection: local
   gather_facts: false
   vars:
     rke2_bootstrap_node: cp
     rke2_require_token: false
   tasks:
+    - ansible.builtin.assert:
+        that:
+          - hostvars['localhost'].rke2_target_hosts == expected_targets
+          - inventory_hostname in expected_targets
+          - "'late-worker' not in hostvars['localhost'].rke2_target_hosts"
     - ansible.builtin.include_tasks: ../tasks/rke2-barrier.yml
-    - name: Mutation sentinel must never execute
+    - name: Mutation sentinel must never execute after failed readiness
       ansible.builtin.debug:
         msg: UNSAFE_MUTATION_EXECUTED

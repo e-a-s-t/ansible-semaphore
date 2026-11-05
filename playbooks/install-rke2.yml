@@ -1,36 +1,14 @@
 ---
 - name: Classify RKE2 installation state
-  hosts: control_plane:worker
+  hosts: "{{ (groups['control_plane'] | default([]) | union(groups['worker'] | default([]))) | difference(['localhost', '127.0.0.1', '::1']) }}"
   gather_facts: false
   strategy: linear
   become: true
   vars_files:
     - ../vars/rke2.yml
   pre_tasks:
-    - name: Prepare controller-local execution
-      ansible.builtin.include_tasks: ../tasks/rke2-controller.yml
-
-    - name: Initialize current-run cluster readiness
-      ansible.builtin.set_fact:
-        rke2_target_hosts: "{{ ansible_play_hosts_all }}"
-        rke2_source_ready: false
-        rke2_token_ready: false
-        rke2_bootstrap_complete: false
-        rke2_cluster_token: ''
-        rke2_selected_source: "{{ rke2_token_source_node | trim if rke2_token_source_node | trim else rke2_bootstrap_node }}"
-      delegate_to: localhost
-      delegate_facts: true
-      become: false
-      run_once: true
-
-    - name: Reset every targeted host readiness for this run
-      ansible.builtin.set_fact:
-        rke2_preflight_ready: false
-        rke2_installation_complete: false
-      delegate_to: "{{ item }}"
-      delegate_facts: true
-      run_once: true
-      loop: "{{ hostvars['localhost'].rke2_target_hosts }}"
+    - name: Capture node targets and initialize current-run readiness
+      ansible.builtin.include_tasks: ../tasks/rke2-initialize.yml
 
     - name: Validate RKE2 inventory role
       ansible.builtin.assert:
@@ -175,7 +153,7 @@
       when: rke2_state in ['new', 'incomplete_install', 'matching']
 
 - name: Validate cluster and existing token source before mutation
-  hosts: control_plane:worker
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) }}"
   gather_facts: false
   strategy: linear
   become: true
@@ -192,7 +170,7 @@
 
 - name: Bootstrap or preserve the explicit bootstrap node
   any_errors_fatal: true
-  hosts: control_plane
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) | intersect(groups['control_plane']) }}"
   gather_facts: false
   strategy: linear
   become: true
@@ -345,7 +323,7 @@
       when: inventory_hostname == rke2_bootstrap_node
 
 - name: Acquire the cluster token after bootstrap readiness
-  hosts: control_plane:worker
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) }}"
   gather_facts: false
   strategy: linear
   become: true
@@ -361,7 +339,7 @@
 
 - name: Join additional control-plane nodes
   any_errors_fatal: true
-  hosts: control_plane
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) | intersect(groups['control_plane']) }}"
   serial: 1
   gather_facts: false
   strategy: linear
@@ -474,7 +452,7 @@
 
 - name: Join worker nodes
   any_errors_fatal: true
-  hosts: worker
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) | intersect(groups['worker']) }}"
   serial: 1
   gather_facts: false
   strategy: linear
@@ -676,7 +654,7 @@
       when: ansible_check_mode
 
 - name: Report per-node RKE2 installation state
-  hosts: control_plane:worker
+  hosts: "{{ hostvars['localhost'].rke2_target_hosts | default([]) }}"
   gather_facts: false
   strategy: linear
   become: true
