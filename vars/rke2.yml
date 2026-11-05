@@ -34,3 +34,7 @@ rke2_controller_remote_tmp: "/tmp/ansible-semaphore-{{ lookup('pipe', 'id -u') }
 
 # Destructive removal requires explicit boolean true or string "true" at execution time.
 rke2_remove_confirm: false
+
+# Retry only the installed official runtime cleanup, with independent inspections.
+rke2_remove_cleanup_attempts: 3
+rke2_remove_cleanup_delay: 3

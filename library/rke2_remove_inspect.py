@@ -88,6 +88,42 @@ def environment_content_reason(content):
     return None
 
 
+def classify_mounts(mounts, owned_runtime):
+    """Classify mounts without exempting any mounted deletion path from guards.
+
+    Pod volume bind mounts remain runtime blockers even when backed by the same
+    filesystem as protected storage. Only the Longhorn target tree is protected.
+    No sources or options are included in displayable diagnostics.
+    """
+    result = {key: [] for key in ('cleanup_mounts', 'runtime_mounts',
+                                 'blocking_storage_mounts', 'protected_mounts', 'mount_diagnostics')}
+    for mount in mounts:
+        target, fstype = mount['target'], mount['fstype']
+        protected = target == '/var/lib/longhorn' or target.startswith('/var/lib/longhorn/')
+        namespace = bool(re.fullmatch(r'/run/netns/cni-[^/]+', target))
+        in_cleanup = any(target == p or target.startswith(p + '/') for p in ARTIFACTS)
+        in_cleanup = in_cleanup or target.startswith('/run/netns/cni-') or target.startswith('/sys/fs/bpf/tc/globals/cilium')
+        if not protected and not in_cleanup:
+            continue
+        pod = target.startswith('/var/lib/kubelet/pods/')
+        runtime_tree = any(target == p or target.startswith(p + '/') for p in (
+            '/run/k3s', '/run/rke2', '/var/lib/rancher/rke2/agent/containerd'))
+        runtime = owned_runtime and (pod or (namespace and fstype == 'nsfs') or
+                                    (runtime_tree and fstype in ('tmpfs', 'overlay', 'nsfs')))
+        category = ('protected_longhorn' if protected else 'runtime' if runtime else
+                    'persistent_storage' if fstype in ('ext4', 'xfs', 'btrfs', 'nfs', 'nfs4', 'ceph')
+                    else 'unknown_mount')
+        diagnostic = {'target': diagnostic_path(target), 'fstype': diagnostic_path(fstype),
+                      'classification': category}
+        result['mount_diagnostics'].append(diagnostic)
+        if protected:
+            result['protected_mounts'].append(diagnostic)
+        else:
+            result['cleanup_mounts'].append(target)
+            result['runtime_mounts' if runtime else 'blocking_storage_mounts'].append(diagnostic)
+    return result
+
+
 def inspect(root='/', runner=probe):
     def path(p):
         return Path(root) / p.lstrip('/')
@@ -203,17 +239,6 @@ def inspect(root='/', runner=probe):
                 reject_environment(service, env_path, reason)
     if any(unsafe(p) for p in OWNED + BINS):
         reasons.append('unsafe_cleanup_path')
-    cleanup_mounts = [m['target'] for m in mounts
-                      if any(m['target'] == p or m['target'].startswith(p + '/') for p in OWNED)
-                      or m['target'].startswith('/run/netns/cni-')]
-    # Shared helper symlinks are inspected separately; never delete their targets.
-    for m in mounts:
-        target = m['target']
-        if any(target == p or target.startswith(p + '/') for p in OWNED):
-            if target.startswith('/var/lib/kubelet/pods/'):
-                continue
-            if m.get('fstype') not in ('tmpfs', 'overlay', 'nsfs', 'proc', 'sysfs', 'cgroup2'):
-                reasons.append('persistent_mount_in_cleanup_path')
     server = services['rke2-server']['LoadState'] != 'not-found'
     agent = services['rke2-agent']['LoadState'] != 'not-found'
     binary = exists('/usr/local/bin/rke2')
@@ -278,6 +303,13 @@ def inspect(root='/', runner=probe):
         reasons.append('unrecognized_installation')
     if runtime and not evidence:
         reasons.append('unrecognized_runtime')
+    mount_state = classify_mounts(mounts, evidence and data)
+    cleanup_mounts = mount_state['cleanup_mounts']
+    for mount in mount_state['blocking_storage_mounts']:
+        reasons.append('persistent_mount_in_cleanup_path' if mount['classification'] == 'persistent_storage'
+                       else 'unrecognized_mount_in_cleanup_path')
+    if mount_state['runtime_mounts'] and 'killall' not in scripts:
+        reasons.append('missing_runtime_cleanup_script')
     rc, interfaces = command('ip', '-j', 'link', 'show')
     if rc:
         raise ValueError('network inspection unavailable')
@@ -310,7 +342,8 @@ def inspect(root='/', runner=probe):
             'role': 'server' if server or exists('/var/lib/rancher/rke2/server') else 'agent' if agent else 'unknown',
             'scripts': scripts, 'cleanup_paths': present + helpers + pins,
             'storage': storage, 'cleanup_mounts': cleanup_mounts, 'runtime_active': runtime,
-            'environment_diagnostics': environment_diagnostics}
+            'environment_diagnostics': environment_diagnostics,
+            **mount_state}
 
 
 def main():

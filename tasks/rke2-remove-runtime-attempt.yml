@@ -1,0 +1,58 @@
+---
+- name: Revalidate ownership and storage before a runtime cleanup attempt
+  when: not rke2_remove_runtime_complete
+  block:
+    - name: Allow time for runtime shutdown before retrying
+      ansible.builtin.pause:
+        seconds: "{{ rke2_remove_cleanup_delay }}"
+      when: rke2_remove_attempt > 1
+
+    - name: Inspect safety immediately before retrying runtime cleanup
+      rke2_remove_inspect:
+      register: rke2_remove_attempt_before
+
+    - name: Require safe ownership and unchanged protected storage for this attempt
+      ansible.builtin.assert:
+        that:
+          - rke2_remove_attempt_before.inspection.safe
+          - rke2_remove_attempt_before.inspection.storage == rke2_remove_before.inspection.storage
+        fail_msg: >-
+          Runtime cleanup preconditions changed; no further cleanup is permitted.
+          Mounts={{ rke2_remove_attempt_before.inspection.mount_diagnostics | default([]) }};
+          environment files={{ rke2_remove_attempt_before.inspection.environment_diagnostics | default([]) }}
+
+    - name: Run installed official runtime cleanup before uninstalling
+      ansible.builtin.command:
+        argv: ["{{ rke2_remove_attempt_before.inspection.scripts.killall }}"]
+      environment:
+        RKE2_DATA_DIR: /var/lib/rancher/rke2
+      when: "'killall' in rke2_remove_attempt_before.inspection.scripts"
+      no_log: true
+
+    - name: Inspect runtime shutdown after the official cleanup attempt
+      rke2_remove_inspect:
+      register: rke2_remove_stopped
+
+    - name: Stop retrying if safety or protected storage changed
+      ansible.builtin.assert:
+        that:
+          - rke2_remove_stopped.inspection.safe
+          - rke2_remove_stopped.inspection.storage == rke2_remove_before.inspection.storage
+        fail_msg: >-
+          Runtime cleanup changed safety or protected storage; no further cleanup is permitted.
+          Mounts={{ rke2_remove_stopped.inspection.mount_diagnostics | default([]) }};
+          environment files={{ rke2_remove_stopped.inspection.environment_diagnostics | default([]) }}
+
+    - name: Record independently verified runtime shutdown
+      ansible.builtin.set_fact:
+        rke2_remove_runtime_complete: >-
+          {{ not rke2_remove_stopped.inspection.runtime_active
+             and rke2_remove_stopped.inspection.cleanup_mounts | length == 0 }}
+
+    - name: Report remaining runtime state before another attempt
+      ansible.builtin.debug:
+        msg:
+          attempt: "{{ rke2_remove_attempt }}"
+          runtime_active: "{{ rke2_remove_stopped.inspection.runtime_active }}"
+          mounts: "{{ rke2_remove_stopped.inspection.mount_diagnostics | default([]) }}"
+      when: not rke2_remove_runtime_complete

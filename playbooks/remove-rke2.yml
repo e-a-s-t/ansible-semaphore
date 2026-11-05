@@ -34,6 +34,15 @@
           the full cluster inventory,
           disjoint node roles, an explicit bootstrap, remote nodes, and standard RKE2 paths.
 
+    - name: Validate bounded runtime cleanup settings
+      ansible.builtin.assert:
+        that:
+          - rke2_remove_cleanup_attempts is integer and rke2_remove_cleanup_attempts is not boolean
+          - rke2_remove_cleanup_attempts > 0
+          - rke2_remove_cleanup_delay is integer and rke2_remove_cleanup_delay is not boolean
+          - rke2_remove_cleanup_delay >= 0
+        fail_msg: Cleanup attempts must be a positive integer and cleanup delay a nonnegative integer.
+
     - name: Inspect RKE2 ownership and protected storage
       rke2_remove_inspect:
       register: rke2_remove_before
@@ -43,7 +52,8 @@
         that: rke2_remove_before.inspection.safe
         fail_msg: >-
           Removal refused: {{ rke2_remove_before.inspection.reasons }};
-          environment files={{ rke2_remove_before.inspection.environment_diagnostics | default([]) }}
+          environment files={{ rke2_remove_before.inspection.environment_diagnostics | default([]) }};
+          mounts={{ rke2_remove_before.inspection.mount_diagnostics | default([]) }}
 
     - name: Record successful current-run preflight
       ansible.builtin.set_fact:

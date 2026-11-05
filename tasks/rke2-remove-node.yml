@@ -16,7 +16,8 @@
           - rke2_remove_current.inspection.storage == rke2_remove_before.inspection.storage
         fail_msg: >-
           Removal preconditions changed; refusing cleanup.
-          Environment files={{ rke2_remove_current.inspection.environment_diagnostics | default([]) }}
+          Environment files={{ rke2_remove_current.inspection.environment_diagnostics | default([]) }};
+          mounts={{ rke2_remove_current.inspection.mount_diagnostics | default([]) }}
 
     - name: Stop recognized RKE2 services
       ansible.builtin.systemd_service:
@@ -29,28 +30,21 @@
         - rke2_remove_current.inspection.present
         - (item ~ '.service') in rke2_remove_current.inspection.remaining
 
-    - name: Run installed official runtime cleanup before uninstalling
-      ansible.builtin.command:
-        argv: ["{{ rke2_remove_current.inspection.scripts.killall }}"]
-      environment:
-        RKE2_DATA_DIR: /var/lib/rancher/rke2
+    - name: Initialize current-node runtime cleanup completion
+      ansible.builtin.set_fact:
+        rke2_remove_runtime_complete: false
+
+    - name: Retry verified official runtime cleanup within the configured bound
+      ansible.builtin.include_tasks: rke2-remove-runtime-attempt.yml
+      loop: "{{ range(1, rke2_remove_cleanup_attempts + 1) | list }}"
+      loop_control:
+        loop_var: rke2_remove_attempt
       when:
         - rke2_remove_current.inspection.present
-        - "'killall' in rke2_remove_current.inspection.scripts"
-      no_log: true
+        - not rke2_remove_runtime_complete
 
-    - name: Inspect runtime shutdown before recursive file cleanup
-      rke2_remove_inspect:
-      register: rke2_remove_stopped
-      when: rke2_remove_current.inspection.present
-
-    - name: Refuse recursive cleanup while processes or mounted volumes remain
-      ansible.builtin.assert:
-        that:
-          - not rke2_remove_stopped.inspection.runtime_active
-          - rke2_remove_stopped.inspection.cleanup_mounts | length == 0
-          - rke2_remove_stopped.inspection.storage == rke2_remove_before.inspection.storage
-        fail_msg: Runtime shutdown is incomplete; mounted volumes will not be traversed.
+    - name: Require no blocking mounts immediately before uninstall
+      ansible.builtin.include_tasks: rke2-remove-mount-guard.yml
       when: rke2_remove_current.inspection.present
 
     - name: Run installed official RKE2 uninstaller
@@ -63,6 +57,10 @@
         - rke2_remove_current.inspection.present
         - "'uninstall' in rke2_remove_current.inspection.scripts"
       no_log: true
+
+    - name: Recheck no blocking mounts before fallback recursive cleanup
+      ansible.builtin.include_tasks: rke2-remove-mount-guard.yml
+      when: rke2_remove_current.inspection.present
 
     - name: Remove only inspected RKE2-owned artifacts and partial installation remnants
       ansible.builtin.file:
@@ -108,6 +106,15 @@
     - name: Report sanitized environment-file verification failures
       ansible.builtin.debug:
         msg: "{{ rke2_remove_after.inspection.environment_diagnostics | default([]) }}"
+      when:
+        - not ansible_check_mode
+        - rke2_remove_result == 'INCOMPLETE'
+
+    - name: Report sanitized remaining mounts after incomplete cleanup
+      ansible.builtin.debug:
+        msg:
+          runtime_active: "{{ rke2_remove_after.inspection.runtime_active | default('unknown') }}"
+          mounts: "{{ rke2_remove_after.inspection.mount_diagnostics | default([]) }}"
       when:
         - not ansible_check_mode
         - rke2_remove_result == 'INCOMPLETE'

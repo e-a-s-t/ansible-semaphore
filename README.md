@@ -394,6 +394,35 @@ Longhorn mounts, and `/etc/fstab` are compared before and after cleanup. No disk
 are formatted or partitioned. Preserving Longhorn storage does not automatically
 restore its Kubernetes resources or recover volumes into a rebuilt cluster.
 
+Runtime cleanup is independently verified rather than inferred from the official
+script's exit code. The remover retries the installed official cleanup script up
+to `rke2_remove_cleanup_attempts` times (default **3**), with
+`rke2_remove_cleanup_delay` seconds between attempts (default **3**). Attempts must
+be a positive integer and delay a nonnegative integer. Each attempt revalidates
+ownership and compares protected storage against the original snapshot. A script
+failure, changed storage, or changed safety conditions stops retries immediately.
+Check mode performs no retries or script execution.
+
+Mount diagnostics contain only bounded, escaped targets, filesystem types, and
+classifications: `runtime`, `protected_longhorn`, `persistent_storage`, or
+`unknown_mount`. They omit mount sources, options, and credential values. The
+filesystem at `/var/lib/longhorn` and its descendants are explicitly protected;
+these targets are never automatically unmounted or deleted. A pod volume bind
+mount beneath a cleanup directory still blocks deletion even when backed by
+Longhorn. Unknown or persistent mounts in deletion paths are refused, not treated
+as removable runtime state. Unrelated mounts outside deletion paths are untouched.
+
+Remaining runtime processes or mounts after bounded cleanup produce `INCOMPLETE`.
+No uninstall or fallback recursive deletion proceeds while any mounted cleanup
+path remains, and a worker failure prevents control-plane teardown. Mount safety
+is checked afresh immediately before uninstall and before fallback file cleanup.
+There is no generic, forced, or lazy unmount fallback. If the failure persists,
+review the reported targets and types before operator recovery; do not bypass the
+guard. A previous attempt that stopped services and ran runtime cleanup can be
+rerun with the same full inventory and explicit authorization. Recognized stopped
+installations resume cleanup without restarting services; removed nodes report
+`ABSENT`. Installation and node preparation do not need to be rerun for recovery.
+
 A node reports `REMOVED` only after independent verification. An already removed
 node reports `ABSENT`; uninstall errors or remaining artifacts/storage changes
 produce `INCOMPLETE` and fail the run. After successful removal, run **4. Install

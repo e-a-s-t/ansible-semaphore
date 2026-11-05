@@ -1,0 +1,15 @@
+---
+- name: Inspect all blocking mounts immediately before recursive removal
+  rke2_remove_inspect:
+  register: rke2_remove_guard
+
+- name: Refuse recursive cleanup while processes or mounted volumes remain
+  ansible.builtin.assert:
+    that:
+      - not rke2_remove_guard.inspection.runtime_active
+      - rke2_remove_guard.inspection.cleanup_mounts | length == 0
+      - rke2_remove_guard.inspection.storage == rke2_remove_before.inspection.storage
+    fail_msg: >-
+      Runtime shutdown is incomplete; mounted volumes will not be traversed.
+      Runtime active={{ rke2_remove_guard.inspection.runtime_active }};
+      mounts={{ rke2_remove_guard.inspection.mount_diagnostics | default([]) }}.

@@ -336,6 +336,60 @@ class InspectionTests(unittest.TestCase):
             self.service_properties['rke2-server'] = props
             self.assertIn(reason, self.inspect()['reasons'])
 
+    def test_runtime_mount_classification_and_sanitized_diagnostics(self):
+        mounts = [
+            {'target': '/var/lib/rancher/rke2/agent/containerd/snapshot/rootfs', 'fstype': 'overlay'},
+            {'target': '/run/k3s/containerd/sandbox/shm', 'fstype': 'tmpfs'},
+            {'target': '/var/lib/kubelet/pods/uid/volumes/kubernetes.io~secret/token', 'fstype': 'tmpfs'},
+            {'target': '/run/netns/cni-fixture', 'fstype': 'nsfs'},
+        ]
+        for mount in mounts:
+            mount.update(source='fixture-secret', options='password=fixture-secret')
+        result = removal.classify_mounts(self.mounts + mounts, True)
+        self.assertEqual(result['cleanup_mounts'], [m['target'] for m in mounts])
+        self.assertEqual(len(result['runtime_mounts']), 4)
+        self.assertEqual(result['blocking_storage_mounts'], [])
+        self.assertEqual(result['protected_mounts'], [
+            {'target': '/var/lib/longhorn', 'fstype': 'ext4', 'classification': 'protected_longhorn'}])
+        self.assertNotIn('fixture-secret', str(result))
+
+    def test_persistent_and_unknown_cleanup_mounts_remain_blocking(self):
+        mounts = [
+            {'target': '/var/lib/rancher/rke2/data', 'fstype': 'ext4'},
+            {'target': '/var/log/pods/unknown', 'fstype': 'tmpfs'},
+            {'target': '/var/lib/kubelet/pods-other', 'fstype': 'tmpfs'},
+            {'target': '/usr/local/share/rke2', 'fstype': 'xfs'},
+        ]
+        result = removal.classify_mounts(mounts, True)
+        self.assertEqual(result['cleanup_mounts'], [m['target'] for m in mounts])
+        self.assertEqual(len(result['blocking_storage_mounts']), 4)
+        self.assertEqual(result['runtime_mounts'], [])
+        unknown = removal.classify_mounts([{'target': '/run/k3s/containerd', 'fstype': 'tmpfs'}], False)
+        self.assertEqual(unknown['runtime_mounts'], [])
+        self.assertTrue(unknown['cleanup_mounts'])
+
+    def test_longhorn_filesystem_is_protected_but_pod_bind_mount_is_blocking(self):
+        pod = {'target': '/var/lib/kubelet/pods/uid/volumes/data', 'fstype': 'ext4',
+               'source': '/dev/sdb[/volumes/pvc]'}
+        nested = {'target': '/var/lib/longhorn/nested', 'fstype': 'xfs'}
+        result = removal.classify_mounts(self.mounts + [pod, nested], True)
+        self.assertEqual(result['cleanup_mounts'], [pod['target']])
+        self.assertEqual(len(result['protected_mounts']), 2)
+        self.assertEqual(result['runtime_mounts'][0]['target'], pod['target'])
+        self.assertNotIn('/var/lib/longhorn', result['cleanup_mounts'])
+
+    def test_interrupted_removal_with_stopped_services_remains_recognizable(self):
+        self.install(role='agent', scripts=False)
+        self.services['rke2-agent'] = ('loaded', 'inactive')
+        self.processes = ''
+        result = self.inspect()
+        self.assertTrue(result['safe'], result['reasons'])
+        self.assertFalse(result['runtime_active'])
+        self.assertEqual(result['cleanup_mounts'], [])
+        self.assertTrue(result['present'])
+        self.assertIn('/var/lib/rancher/rke2', result['cleanup_paths'])
+        self.assertEqual(result['storage']['mounts'], self.mounts)
+
     def test_persistent_mount_beneath_cleanup_rejected(self):
         self.install(scripts=False)
         self.mounts.append({'target': '/var/lib/rancher/rke2/data', 'source': '/dev/sdb', 'fstype': 'ext4'})
@@ -345,6 +399,8 @@ class InspectionTests(unittest.TestCase):
 # These action plugins return fixtures, never dispatch remote modules. The production
 # playbook, assertions, includes, conditions, rescue and ordering execute in Ansible.
 INSPECT_ACTION = '''
+import json
+from pathlib import Path
 from ansible.plugins.action import ActionBase
 class ActionModule(ActionBase):
     def run(self, tmp=None, task_vars=None):
@@ -356,16 +412,33 @@ class ActionModule(ActionBase):
         phase = 'after' if after else ('current' if self._task.name.startswith('Reinspect') else 'before')
         unsafe = host == v.get('fixture_unsafe_host', '') or phase == v.get('fixture_unsafe_phase', '')
         present = v.get('fixture_present', True) and (not after or v.get('fixture_residual', False))
-        storage = {'uuid': 'protected-disk', 'fstab': 'original'}
+        events = Path(v['fixture_events'])
+        recorded = [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
+        calls = [event for event in recorded if event['host'] == host and event['operation'] == 'ansible.builtin.command']
+        kill_count = sum(event['arguments']['argv'][0].endswith('killall.sh') for event in calls)
+        uninstall_count = sum(event['arguments']['argv'][0].endswith('uninstall.sh') for event in calls)
+        transient = kill_count < v.get('fixture_clear_after', 0)
+        mounted = v.get('fixture_mount_residual', False) or transient
+        if v.get('fixture_guard_mount', False) and uninstall_count:
+            mounted = True
+        active = kill_count < v.get('fixture_process_clear_after', 0)
+        protected = {'target': '/var/lib/longhorn', 'fstype': 'ext4', 'classification': 'protected_longhorn'}
+        mount = {'target': '/var/lib/kubelet/pods/fixture/shm', 'fstype': 'tmpfs', 'classification': 'runtime'}
+        storage = {'uuid': 'protected-disk', 'fstab': 'original', 'mounts': [protected]}
+        if v.get('fixture_retry_storage_change', False) and kill_count:
+            storage['fstab'] = 'changed'
+        if v.get('fixture_retry_unsafe', False) and kill_count:
+            unsafe = True
         if after and v.get('fixture_storage_change', False):
             storage['fstab'] = 'changed'
         role = 'server' if 'control_plane' in v['group_names'] else 'agent'
         return {'changed': False, 'inspection': {
             'safe': not unsafe, 'reasons': ['fixture'],
             'environment_diagnostics': v.get('fixture_environment_diagnostics', []) if unsafe else [],
-            'present': present, 'remaining': ['rke2-' + role + '.service'] if present else [],
+            'present': present or mounted or active, 'remaining': ['rke2-' + role + '.service'] if present else [],
             'storage': storage, 'cleanup_paths': ['/fixture/rke2'],
-            'runtime_active': False, 'cleanup_mounts': ['/fixture/mounted-volume'] if v.get('fixture_mount_residual', False) else [],
+            'runtime_active': active, 'cleanup_mounts': [mount['target']] if mounted else [],
+            'mount_diagnostics': [protected] + ([mount] if mounted else []),
             'scripts': v.get('fixture_scripts', {'uninstall': '/fixture/rke2-uninstall.sh'})}}
 '''
 MUTATE_ACTION = '''
@@ -403,7 +476,8 @@ class OrchestrationTests(unittest.TestCase):
                     if 'ansible.builtin.include_tasks' in task:
                         task['ansible.builtin.include_tasks'] = str(base / Path(task['ansible.builtin.include_tasks']).name)
 
-            for name in ('rke2-remove-node.yml', 'rke2-remove-barrier.yml'):
+            for name in ('rke2-remove-node.yml', 'rke2-remove-barrier.yml',
+                         'rke2-remove-runtime-attempt.yml', 'rke2-remove-mount-guard.yml'):
                 data = yaml.safe_load((ROOT / 'tasks' / name).read_text())
                 transform(data)
                 (base / name).write_text(yaml.safe_dump(data))
@@ -419,7 +493,8 @@ class OrchestrationTests(unittest.TestCase):
             inv = base / 'inventory.yml'
             inv.write_text(yaml.safe_dump(inventory))
             events = base / 'events'
-            extra = {'rke2_bootstrap_node': 'cp', 'rke2_remove_confirm': True, 'fixture_events': str(events)}
+            extra = {'rke2_bootstrap_node': 'cp', 'rke2_remove_confirm': True,
+                     'rke2_remove_cleanup_delay': 0, 'fixture_events': str(events)}
             extra.update(variables or {})
             if extra.get('rke2_remove_confirm') == 'omit':
                 del extra['rke2_remove_confirm']
@@ -458,6 +533,55 @@ class OrchestrationTests(unittest.TestCase):
             commands = [v['arguments']['argv'][0] for v in events
                         if v['host'] == host and v['operation'] == 'ansible.builtin.command']
             self.assertEqual(commands, ['/fixture/rke2-killall.sh', '/fixture/rke2-uninstall.sh'])
+
+    def test_transient_mounts_and_processes_clear_on_retry(self):
+        scripts = {'killall': '/fixture/rke2-killall.sh', 'uninstall': '/fixture/rke2-uninstall.sh'}
+        rc, output, events = self.run_case({'fixture_scripts': scripts, 'fixture_clear_after': 2,
+                                          'fixture_process_clear_after': 2})
+        self.assertEqual(rc, 0, output)
+        for host in ('worker', 'extra', 'cp'):
+            commands = [e['arguments']['argv'][0] for e in events
+                        if e['host'] == host and e['operation'] == 'ansible.builtin.command']
+            self.assertEqual(commands, [scripts['killall'], scripts['killall'], scripts['uninstall']])
+        self.assertIn('protected_longhorn', output)
+
+    def test_persistent_runtime_mounts_exhaust_bound_without_uninstalling(self):
+        scripts = {'killall': '/fixture/rke2-killall.sh', 'uninstall': '/fixture/rke2-uninstall.sh'}
+        rc, output, events = self.run_case({'fixture_scripts': scripts, 'fixture_mount_residual': True})
+        self.assertEqual(rc, 2, output)
+        commands = [e['arguments']['argv'][0] for e in events if e['operation'] == 'ansible.builtin.command']
+        self.assertEqual(commands, [scripts['killall']] * 3)
+        self.assertEqual({e['host'] for e in events}, {'worker'})
+        self.assertFalse(any(e['operation'] == 'ansible.builtin.file' for e in events))
+        self.assertIn('/var/lib/kubelet/pods/fixture/shm', output)
+        self.assertIn('tmpfs', output)
+        self.assertIn('INCOMPLETE', output)
+
+    def test_script_failure_and_changed_safety_abort_retries(self):
+        scripts = {'killall': '/fixture/rke2-killall.sh', 'uninstall': '/fixture/rke2-uninstall.sh'}
+        for flag in ('fixture_uninstall_failure', 'fixture_retry_storage_change', 'fixture_retry_unsafe'):
+            with self.subTest(flag=flag):
+                rc, output, events = self.run_case({'fixture_scripts': scripts, 'fixture_clear_after': 2, flag: True})
+                self.assertEqual(rc, 2, output)
+                commands = [e['arguments']['argv'][0] for e in events if e['operation'] == 'ansible.builtin.command']
+                self.assertEqual(commands, [scripts['killall']])
+                self.assertEqual({e['host'] for e in events}, {'worker'})
+                self.assertFalse(any(e['operation'] == 'ansible.builtin.file' for e in events))
+
+    def test_new_mount_after_uninstall_blocks_fallback_deletion(self):
+        rc, output, events = self.run_case({'fixture_guard_mount': True})
+        self.assertEqual(rc, 2, output)
+        self.assertFalse(any(e['operation'] == 'ansible.builtin.file' for e in events))
+        self.assertEqual({e['host'] for e in events}, {'worker'})
+        self.assertIn('tmpfs', output)
+
+    def test_invalid_retry_settings_are_rejected_before_mutation(self):
+        for variables in ({'rke2_remove_cleanup_attempts': 0}, {'rke2_remove_cleanup_attempts': True},
+                          {'rke2_remove_cleanup_delay': -1}, {'rke2_remove_cleanup_delay': '3'}):
+            with self.subTest(variables=variables):
+                rc, output, events = self.run_case(variables)
+                self.assertEqual(rc, 2, output)
+                self.assertEqual(events, [])
 
     def test_absent_is_noop(self):
         rc, output, events = self.run_case({'fixture_present': False})
