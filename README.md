@@ -329,11 +329,18 @@ require review; do not bypass drift checks or recreate markers blindly.
 
 Create a Semaphore task template named **5. Remove RKE2**, using playbook
 `playbooks/remove-rke2.yml` and inventory `inventories/lab/hosts.yml`.
-Supply the boolean confirmation explicitly in the execution's extra variables:
+Supply confirmation explicitly in the execution's extra variables:
 
 ```json
 {"rke2_remove_confirm": true}
 ```
+
+Configure a Semaphore survey variable named `rke2_remove_confirm` as an **Enum**
+with choices `false` and `true`, defaulting to `false`. Semaphore passes survey
+values as strings; explicitly select `true` to authorize removal for that execution.
+The playbook accepts native YAML boolean `true` or the string `"true"`
+(case-insensitive). Missing, false, empty, whitespace-padded, and arbitrary values
+are rejected; values such as `yes` and `1` do not authorize removal.
 
 The default is false. Never put destructive authorization in inventory. Running
 this template alone does not authorize removal. The command-line equivalent is:

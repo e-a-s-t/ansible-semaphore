@@ -302,14 +302,25 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertEqual(output.count('| ABSENT'), 3)
 
-    def test_missing_and_non_boolean_confirmation(self):
-        for value in ('omit', False, 'true', None):
-            rc, output, events = self.run_case({'rke2_remove_confirm': value})
-            self.assertEqual(rc, 2, output)
-            self.assertEqual(events, [])
+    def test_accepted_confirmation_values(self):
+        for value in (True, 'true', 'TRUE', 'True'):
+            with self.subTest(value=value):
+                rc, output, events = self.run_case({'rke2_remove_confirm': value})
+                self.assertEqual(rc, 0, output)
+                self.assertTrue(events)
+                self.assertEqual(output.count('| REMOVED'), 3)
+
+    def test_rejected_confirmation_values(self):
+        for value in ('omit', False, 'false', 'FALSE', None, '', 'yes', '1', 1,
+                      0, ' true ', [], {}, ['true'], {'confirm': True}):
+            with self.subTest(value=value):
+                rc, output, events = self.run_case({'rke2_remove_confirm': value})
+                self.assertEqual(rc, 2, output)
+                self.assertEqual(events, [])
 
     def test_partial_scope_and_invalid_bootstrap(self):
-        for variables, limit in (({}, 'worker'), ({'rke2_bootstrap_node': 'worker'}, None)):
+        for variables, limit in (({}, 'worker'), ({'rke2_remove_confirm': 'true'}, 'worker'),
+                                 ({'rke2_bootstrap_node': 'worker'}, None)):
             rc, output, events = self.run_case(variables, limit=limit)
             self.assertEqual(rc, 2, output)
             self.assertEqual(events, [])
@@ -332,10 +343,12 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(events, [])
 
     def test_check_mode_no_mutation(self):
-        rc, output, events = self.run_case(check=True)
-        self.assertEqual(rc, 0, output)
-        self.assertEqual(events, [])
-        self.assertEqual(output.count('WOULD REMOVE'), 3)
+        for value in (True, 'true', 'TRUE'):
+            with self.subTest(value=value):
+                rc, output, events = self.run_case({'rke2_remove_confirm': value}, check=True)
+                self.assertEqual(rc, 0, output)
+                self.assertEqual(events, [])
+                self.assertEqual(output.count('WOULD REMOVE'), 3)
         rc, _, events = self.run_case({'rke2_remove_confirm': False}, check=True)
         self.assertNotEqual(rc, 0)
         self.assertEqual(events, [])
