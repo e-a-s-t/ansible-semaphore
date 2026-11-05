@@ -193,8 +193,14 @@ trusted Cilium CNI evidence are present. Evidence must be a supported
 with a regular root-owned file, no group/world write permissions, and no symlink
 in its path. Other mounts under `/run/cilium` and unrelated `cgroup2` mounts do
 not gain runtime classification. Recognition does not exempt the Cilium mount
-from cleanup guards: it must disappear after official cleanup, or the existing
-bounded attempts fail with `INCOMPLETE`. No additional unmount command is used.
+from cleanup guards. After official cleanup, a sole residual recognized Cilium
+mount is released with normal `umount /run/cilium/cgroupv2`, only after fresh
+inspection confirms safe ownership, stopped RKE2 services, no relevant runtime
+processes, and unchanged protected storage. No additional official cleanup
+attempt is made for this residual mount. An absent mount needs no unmount.
+A failed or busy unmount stops safely with sanitized diagnostics. Independent
+inspection must confirm the mount is gone and protected storage is unchanged
+before uninstall or recursive cleanup. Command success alone is insufficient.
 
 Remaining runtime processes or mounts after bounded cleanup produce `INCOMPLETE`.
 No uninstall or fallback recursive deletion proceeds while any mounted cleanup

@@ -43,6 +43,48 @@
           Mounts={{ rke2_remove_stopped.inspection.mount_diagnostics | default([]) }};
           environment files={{ rke2_remove_stopped.inspection.environment_diagnostics | default([]) }}
 
+    - name: Release the sole recognized residual Cilium cgroup mount
+      when: rke2_remove_stopped.inspection.cleanup_mounts == ['/run/cilium/cgroupv2']
+      block:
+        - name: Require stopped services and runtime with exact trusted Cilium mount
+          ansible.builtin.assert:
+            that:
+              - rke2_remove_stopped.inspection.safe
+              - rke2_remove_stopped.inspection.services_stopped
+              - not rke2_remove_stopped.inspection.runtime_active
+              - >-
+                rke2_remove_stopped.inspection.runtime_mounts == [{'target': '/run/cilium/cgroupv2', 'fstype': 'cgroup2', 'classification': 'runtime'}]
+              - rke2_remove_stopped.inspection.storage == rke2_remove_before.inspection.storage
+            fail_msg: Residual Cilium unmount refused; ownership, shutdown, or storage preconditions failed.
+
+        - name: Normally unmount only the verified Cilium cgroup target
+          ansible.builtin.command:
+            argv: [umount, /run/cilium/cgroupv2]
+          register: rke2_remove_cilium_unmount
+          failed_when: false
+          no_log: true
+
+        - name: Independently inspect after the Cilium unmount attempt
+          rke2_remove_inspect:
+          register: rke2_remove_cilium_after
+
+        - name: Require successful Cilium unmount and independent absence verification
+          ansible.builtin.assert:
+            that:
+              - rke2_remove_cilium_unmount.rc | default(-1) == 0
+              - rke2_remove_cilium_after.inspection.safe
+              - rke2_remove_cilium_after.inspection.services_stopped
+              - not rke2_remove_cilium_after.inspection.runtime_active
+              - rke2_remove_cilium_after.inspection.cleanup_mounts | length == 0
+              - rke2_remove_cilium_after.inspection.storage == rke2_remove_before.inspection.storage
+            fail_msg: >-
+              Normal unmount of /run/cilium/cgroupv2 failed or could not be independently verified
+              (possibly busy); cleanup stopped safely. No forced or lazy unmount is permitted.
+
+        - name: Use independently verified post-unmount runtime state
+          ansible.builtin.set_fact:
+            rke2_remove_stopped: "{{ rke2_remove_cilium_after }}"
+
     - name: Record independently verified runtime shutdown
       ansible.builtin.set_fact:
         rke2_remove_runtime_complete: >-

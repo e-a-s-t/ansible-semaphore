@@ -479,6 +479,21 @@ class InspectionTests(unittest.TestCase):
         self.assertIn('/var/lib/rancher/rke2', result['cleanup_paths'])
         self.assertEqual(result['storage']['mounts'], self.mounts)
 
+    def test_service_shutdown_and_cilium_process_detection(self):
+        self.install(scripts=False)
+        self.assertFalse(self.inspect()['services_stopped'])
+        for state in ('active', 'activating', 'deactivating', 'reloading', 'unknown'):
+            self.services['rke2-server'] = ('loaded', state)
+            self.assertFalse(self.inspect()['services_stopped'])
+        for state in ('inactive', 'failed'):
+            self.services['rke2-server'] = ('loaded', state)
+            self.assertTrue(self.inspect()['services_stopped'])
+        for process in ('/usr/bin/cilium-agent --foo', '/usr/bin/cilium-envoy --foo',
+                        '/var/lib/rancher/rke2/data/bin/containerd',
+                        '/var/lib/rancher/rke2/data/bin/kubelet'):
+            self.processes = process
+            self.assertTrue(self.inspect()['runtime_active'])
+
     def test_persistent_mount_beneath_cleanup_rejected(self):
         self.install(scripts=False)
         self.mounts.append({'target': '/var/lib/rancher/rke2/data', 'source': '/dev/sdb', 'fstype': 'ext4'})
@@ -510,11 +525,20 @@ class ActionModule(ActionBase):
         mounted = v.get('fixture_mount_residual', False) or transient
         if v.get('fixture_guard_mount', False) and uninstall_count:
             mounted = True
+        unmount_count = sum(event['arguments']['argv'][0] == 'umount' for event in calls)
+        if unmount_count and not v.get('fixture_unmount_busy', False) and not v.get('fixture_unmount_still_mounted', False):
+            mounted = False
         active = kill_count < v.get('fixture_process_clear_after', 0)
+        stopped = any(event['host'] == host and event['operation'] == 'ansible.builtin.systemd_service'
+                      and event['arguments'].get('state') == 'stopped' for event in recorded)
+        stopped = stopped and not v.get('fixture_service_active', False)
         protected = {'target': '/var/lib/longhorn', 'fstype': 'ext4', 'classification': 'protected_longhorn'}
         mount = {'target': '/var/lib/kubelet/pods/fixture/shm', 'fstype': 'tmpfs', 'classification': 'runtime'}
         if v.get('fixture_cilium_mount', False):
-            mount = {'target': '/run/cilium/cgroupv2', 'fstype': 'cgroup2', 'classification': 'runtime'}
+            mount = {'target': '/run/cilium/cgroupv2', 'fstype': v.get('fixture_cilium_fstype', 'cgroup2'), 'classification': 'runtime'}
+            if mount['fstype'] != 'cgroup2':
+                mount['classification'] = 'unknown_mount'
+                unsafe = mounted
         storage = {'uuid': 'protected-disk', 'fstab': 'original', 'mounts': [protected]}
         if v.get('fixture_retry_storage_change', False) and kill_count:
             storage['fstab'] = 'changed'
@@ -528,7 +552,9 @@ class ActionModule(ActionBase):
             'environment_diagnostics': v.get('fixture_environment_diagnostics', []) if unsafe else [],
             'present': present or mounted or active, 'remaining': ['rke2-' + role + '.service'] if present else [],
             'storage': storage, 'cleanup_paths': ['/fixture/rke2'],
-            'runtime_active': active, 'cleanup_mounts': [mount['target']] if mounted else [],
+            'runtime_active': active, 'services_stopped': stopped,
+            'runtime_mounts': [mount] if mounted and mount['classification'] == 'runtime' else [],
+            'cleanup_mounts': [mount['target']] if mounted else [],
             'mount_diagnostics': [protected] + ([mount] if mounted else []),
             'scripts': v.get('fixture_scripts', {'uninstall': '/fixture/rke2-uninstall.sh'})}}
 '''
@@ -541,7 +567,8 @@ class ActionModule(ActionBase):
         with open(task_vars['fixture_events'], 'a') as stream:
             stream.write(json.dumps({'host': task_vars['inventory_hostname'], 'operation': args['operation'], 'arguments': args['arguments']}) + '\\n')
         fail = task_vars.get('fixture_uninstall_failure', False) and args['operation'] == 'ansible.builtin.command'
-        return {'changed': True, 'failed': fail, 'msg': 'non-zero return code' if fail else 'fixture', 'stdout': 'fixture-secret' if fail else ''}
+        fail = fail or (args['operation'] == 'ansible.builtin.command' and args['arguments']['argv'][0] == 'umount' and task_vars.get('fixture_unmount_busy', False))
+        return {'rc': 1 if fail else 0, 'changed': True, 'failed': fail, 'msg': 'non-zero return code' if fail else 'fixture', 'stdout': 'fixture-secret' if fail else ''}
 '''
 
 
@@ -636,34 +663,47 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual(commands, [scripts['killall'], scripts['killall'], scripts['uninstall']])
         self.assertIn('protected_longhorn', output)
 
-    def test_cilium_mount_release_and_persistent_failure(self):
+    def test_residual_cilium_unmount_and_worker_order(self):
         scripts = {'killall': '/fixture/rke2-killall.sh', 'uninstall': '/fixture/rke2-uninstall.sh'}
-        for clears_after in (1, 2, None):
-            with self.subTest(clears_after=clears_after):
-                variables = {'fixture_scripts': scripts, 'fixture_cilium_mount': True}
-                if clears_after is None:
-                    variables['fixture_mount_residual'] = True
-                else:
-                    variables['fixture_clear_after'] = clears_after
-                rc, output, events = self.run_case(variables)
-                self.assertEqual(rc, 2 if clears_after is None else 0, output)
+        rc, output, events = self.run_case({'fixture_scripts': scripts, 'fixture_cilium_mount': True,
+                                          'fixture_mount_residual': True})
+        self.assertEqual(rc, 0, output)
+        self.assertEqual(list(dict.fromkeys(e['host'] for e in events)), ['worker', 'extra', 'cp'])
+        for host in ('worker', 'extra', 'cp'):
+            commands = [e['arguments']['argv'] for e in events
+                        if e['host'] == host and e['operation'] == 'ansible.builtin.command']
+            self.assertEqual(commands, [[scripts['killall']], ['umount', '/run/cilium/cgroupv2'], [scripts['uninstall']]])
+        self.assertFalse(any('/var/lib/longhorn' in str(e) for e in events))
+        self.assertNotIn('fixture-secret', output)
+
+    def test_absent_cilium_mount_needs_no_unmount(self):
+        rc, output, events = self.run_case({'fixture_cilium_mount': True})
+        self.assertEqual(rc, 0, output)
+        self.assertFalse(any(e['operation'] == 'ansible.builtin.command'
+                             and e['arguments']['argv'][0] == 'umount' for e in events))
+
+    def test_cilium_unmount_refusals_and_verification_failures(self):
+        scripts = {'killall': '/fixture/rke2-killall.sh', 'uninstall': '/fixture/rke2-uninstall.sh'}
+        for flag, value, expected_unmounts in (
+            ('fixture_unmount_busy', True, 1),
+            ('fixture_unmount_still_mounted', True, 1),
+            ('fixture_cilium_fstype', 'tmpfs', 0),
+            ('fixture_process_clear_after', 99, 0),
+            ('fixture_service_active', True, 0),
+        ):
+            with self.subTest(flag=flag):
+                rc, output, events = self.run_case({'fixture_scripts': scripts, 'fixture_cilium_mount': True,
+                                                  'fixture_mount_residual': True, flag: value})
+                self.assertNotEqual(rc, 0, output)
+                self.assertEqual({e['host'] for e in events}, set() if flag == 'fixture_cilium_fstype' else {'worker'})
+                commands = [e['arguments']['argv'][0] for e in events if e['operation'] == 'ansible.builtin.command']
+                self.assertEqual(commands.count('umount'), expected_unmounts)
+                self.assertNotIn(scripts['uninstall'], commands)
+                self.assertLessEqual(commands.count(scripts['killall']), 1)
+                self.assertFalse(any(e['operation'] == 'ansible.builtin.file' for e in events))
+                self.assertFalse(any('/var/lib/longhorn' in str(e) for e in events))
+                self.assertIn('Removal refused' if flag == 'fixture_cilium_fstype' else 'INCOMPLETE', output)
                 self.assertNotIn('fixture-secret', output)
-                self.assertFalse(any(e['operation'] == 'ansible.builtin.file'
-                                     and e['arguments']['path'].startswith('/var/lib/longhorn') for e in events))
-                if clears_after is None:
-                    commands = [e['arguments']['argv'][0] for e in events
-                                if e['operation'] == 'ansible.builtin.command']
-                    self.assertEqual(commands, [scripts['killall']] * 3)
-                    self.assertFalse(any(e['operation'] == 'ansible.builtin.file' for e in events))
-                    self.assertEqual({e['host'] for e in events}, {'worker'})
-                    self.assertIn('/run/cilium/cgroupv2', output)
-                    self.assertIn('cgroup2', output)
-                    self.assertIn('INCOMPLETE', output)
-                else:
-                    for host in ('worker', 'extra', 'cp'):
-                        commands = [e['arguments']['argv'][0] for e in events
-                                    if e['host'] == host and e['operation'] == 'ansible.builtin.command']
-                        self.assertEqual(commands, [scripts['killall']] * clears_after + [scripts['uninstall']])
 
     def test_persistent_runtime_mounts_exhaust_bound_without_uninstalling(self):
         scripts = {'killall': '/fixture/rke2-killall.sh', 'uninstall': '/fixture/rke2-uninstall.sh'}

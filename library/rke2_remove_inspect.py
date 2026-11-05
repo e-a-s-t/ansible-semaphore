@@ -163,7 +163,7 @@ def inspect(root='/', runner=probe):
     if rc:
         raise ValueError('process inspection unavailable')
     # Exclude only this inspector's own interpreter invocation, never arbitrary workloads.
-    runtime = any(re.search(r'(^|/)(rke2|containerd-shim[^ /]*)( |$)', line)
+    runtime = any(re.search(r'(^|/)(rke2|cilium-agent|cilium-envoy|containerd-shim[^ /]*)( |$)', line)
                   for line in processes.splitlines())
     runtime = runtime or any('/var/lib/rancher/rke2/' in line for line in processes.splitlines())
     foreign = foreign or any(re.search(r'(^|/)(k3s|k0s|microk8s)( |$)', line)
@@ -361,6 +361,8 @@ def inspect(root='/', runner=probe):
             'role': 'server' if server or exists('/var/lib/rancher/rke2/server') else 'agent' if agent else 'unknown',
             'scripts': scripts, 'cleanup_paths': present + helpers + pins,
             'storage': storage, 'cleanup_mounts': cleanup_mounts, 'runtime_active': runtime,
+            'services_stopped': all(services[n]['ActiveState'] in ('inactive', 'failed')
+                                    for n in ('rke2-server', 'rke2-agent')),
             'environment_diagnostics': environment_diagnostics,
             **mount_state}
 

@@ -210,7 +210,7 @@ Steps: Run removal inspection and orchestration tests.\
 Expected result: Only exact owned cgroup2 runtime state is recognized; it still must disappear before deletion; persistent failure blocks uninstall.\
 Status: Implemented
 
-Evidence / coverage boundary: [removal tests](../tests/test_rke2_removal.py): test_cilium_cgroup_requires_trusted_cni_evidence, test_cgroup_mount_recognition_is_exact_and_requires_rke2_ownership, test_cilium_mount_release_and_persistent_failure.
+Evidence / coverage boundary: [removal tests](../tests/test_rke2_removal.py): test_cilium_cgroup_requires_trusted_cni_evidence, test_cgroup_mount_recognition_is_exact_and_requires_rke2_ownership, test_residual_cilium_unmount_and_worker_order, test_absent_cilium_mount_needs_no_unmount, test_cilium_unmount_refusals_and_verification_failures, test_service_shutdown_and_cilium_process_detection.
 
 ### TC-018
 
