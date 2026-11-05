@@ -412,6 +412,16 @@ mount beneath a cleanup directory still blocks deletion even when backed by
 Longhorn. Unknown or persistent mounts in deletion paths are refused, not treated
 as removable runtime state. Unrelated mounts outside deletion paths are untouched.
 
+The exact `/run/cilium/cgroupv2` mount with filesystem type `cgroup2` is recognized
+as expected runtime state during preflight only when RKE2 runtime ownership and
+trusted Cilium CNI evidence are present. Evidence must be a supported
+`05-cilium.conf` or `05-cilium.conflist` containing a valid `cilium-cni` plugin,
+with a regular root-owned file, no group/world write permissions, and no symlink
+in its path. Other mounts under `/run/cilium` and unrelated `cgroup2` mounts do
+not gain runtime classification. Recognition does not exempt the Cilium mount
+from cleanup guards: it must disappear after official cleanup, or the existing
+bounded attempts fail with `INCOMPLETE`. No additional unmount command is used.
+
 Remaining runtime processes or mounts after bounded cleanup produce `INCOMPLETE`.
 No uninstall or fallback recursive deletion proceeds while any mounted cleanup
 path remains, and a worker failure prevents control-plane teardown. Mount safety

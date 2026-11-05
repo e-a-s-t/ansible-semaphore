@@ -227,6 +227,19 @@ class InspectionTests(unittest.TestCase):
         self.assertNotIn('fixture-secret', removal.diagnostic_path('/custom?token=fixture-secret'))
         self.assertLessEqual(len(removal.diagnostic_path('/' + 'x' * 1000)), 256)
 
+    def trusted_scripts(self):
+        original_stat = Path.stat
+
+        def root_script_stat(path, *args, **kwargs):
+            stat = original_stat(path, *args, **kwargs)
+            if path.name in ('rke2-uninstall.sh', 'rke2-killall.sh'):
+                fields = list(stat)
+                fields[4] = 0
+                return os.stat_result(fields)
+            return stat
+
+        return patch.object(Path, 'stat', root_script_stat)
+
     def test_already_absent_and_storage_snapshot(self):
         result = self.inspect()
         self.assertTrue(result['safe'])
@@ -260,17 +273,8 @@ class InspectionTests(unittest.TestCase):
         self.interfaces = ['cilium_net', 'cilium_vxlan']
         self.rules = '-A FORWARD -j CILIUM_FORWARD'
         self.write('/etc/cni/net.d/05-cilium.conflist', '{"plugins":[{"type":"cilium-cni"}]}')
-        original_stat = Path.stat
-
-        def root_script_stat(path, *args, **kwargs):
-            stat = original_stat(path, *args, **kwargs)
-            if path.name in ('rke2-uninstall.sh', 'rke2-killall.sh'):
-                fields = list(stat)
-                fields[4] = 0
-                return os.stat_result(fields)
-            return stat
-
-        with patch.object(Path, 'stat', root_script_stat):
+        self.environment_uids[str(self.root / 'etc/cni/net.d/05-cilium.conflist')] = 0
+        with self.trusted_scripts():
             result = self.inspect()
             self.assertTrue(result['safe'], result['reasons'])
             self.assertEqual(set(result['scripts']), {'uninstall', 'killall'})
@@ -335,6 +339,91 @@ class InspectionTests(unittest.TestCase):
         ):
             self.service_properties['rke2-server'] = props
             self.assertIn(reason, self.inspect()['reasons'])
+
+    def test_cilium_cgroup_preflight_for_server_and_agent(self):
+        mount = {'target': '/run/cilium/cgroupv2', 'fstype': 'cgroup2', 'source': 'fixture-secret'}
+        self.mounts.append(mount)
+        for role in ('server', 'agent'):
+            with self.subTest(role=role):
+                self.install(role=role)
+                cni = self.write('/etc/cni/net.d/05-cilium.conflist',
+                                 '{"plugins":[{"type":"cilium-cni"}]}')
+                self.environment_uids[str(cni)] = 0
+                with self.trusted_scripts():
+                    before = self.inspect()
+                    self.assertTrue(before['safe'], before['reasons'])
+                    self.assertIn(mount['target'], before['cleanup_mounts'])
+                    self.assertEqual(before['runtime_mounts'], [
+                        {'target': mount['target'], 'fstype': 'cgroup2', 'classification': 'runtime'}])
+                    self.assertNotIn('/var/lib/longhorn', before['cleanup_paths'])
+                    self.assertNotIn('fixture-secret', str(before))
+                    self.services['rke2-' + role] = ('loaded', 'inactive')
+                    self.mounts.remove(mount)
+                    after = self.inspect()
+                    self.assertTrue(after['safe'], after['reasons'])
+                    self.assertEqual(after['cleanup_mounts'], [])
+                    self.assertEqual(before['storage'], after['storage'])
+                    self.mounts.append(mount)
+
+    def test_cilium_cgroup_requires_trusted_cni_evidence(self):
+        self.install()
+        mount = {'target': '/run/cilium/cgroupv2', 'fstype': 'cgroup2'}
+        self.mounts.append(mount)
+        filename = '/etc/cni/net.d/05-cilium.conf'
+        with self.trusted_scripts():
+            self.assertIn('unrecognized_mount_in_cleanup_path', self.inspect()['reasons'])
+            cni = self.write(filename, '{"type":"calico"}')
+            self.environment_uids[str(cni)] = 0
+            self.assertIn('unrecognized_mount_in_cleanup_path', self.inspect()['reasons'])
+            cni.write_text('{"type":"cilium-cni"}')
+            self.assertTrue(self.inspect()['safe'])
+            self.environment_uids[str(cni)] = 12345
+            self.assertIn('untrusted_cilium_cni', self.inspect()['reasons'])
+            self.assertIn('unrecognized_mount_in_cleanup_path', self.inspect()['reasons'])
+            self.environment_uids[str(cni)] = 0
+            cni.chmod(0o666)
+            self.assertIn('untrusted_cilium_cni', self.inspect()['reasons'])
+            cni.chmod(0o600)
+            cni.write_text('{"plugins":"fixture-secret"}')
+            self.assertIn('unrecognized_cni', self.inspect()['reasons'])
+            cni.unlink()
+            outside = self.write('/outside', '{"type":"cilium-cni","token":"fixture-secret"}')
+            cni.symlink_to(outside)
+            result = self.inspect()
+            self.assertIn('untrusted_cilium_cni', result['reasons'])
+            self.assertEqual(result['runtime_mounts'], [])
+            self.assertNotIn('fixture-secret', str(result))
+            cni.unlink()
+            cni.parent.rmdir()
+            directory = self.root / 'external-cni'
+            directory.mkdir()
+            cni.parent.symlink_to(directory, target_is_directory=True)
+            self.write(filename, '{"type":"cilium-cni"}')
+            self.assertIn('untrusted_cilium_cni', self.inspect()['reasons'])
+
+    def test_cgroup_mount_recognition_is_exact_and_requires_rke2_ownership(self):
+        mount = {'target': '/run/cilium/cgroupv2', 'fstype': 'cgroup2'}
+        for runtime, cilium in ((True, False), (False, True), (False, False)):
+            result = removal.classify_mounts([mount], runtime, owned_cilium=cilium)
+            self.assertEqual(result['runtime_mounts'], [])
+            self.assertEqual(result['cleanup_mounts'], [mount['target']])
+        for target, fstype in (
+            ('/run/cilium/other', 'cgroup2'),
+            ('/run/cilium/cgroupv2/child', 'cgroup2'),
+            ('/run/cilium/cgroupv2', 'tmpfs'),
+            ('/run/cilium/other', 'tmpfs'),
+            ('/var/lib/kubelet/pods/uid/cgroups', 'cgroup2'),
+            ('/run/k3s/cgroups', 'cgroup2'),
+        ):
+            with self.subTest(target=target, fstype=fstype):
+                result = removal.classify_mounts([{'target': target, 'fstype': fstype}], True, owned_cilium=True)
+                self.assertEqual(result['runtime_mounts'], [])
+                self.assertEqual(result['cleanup_mounts'], [target])
+                self.assertEqual(result['blocking_storage_mounts'][0]['classification'], 'unknown_mount')
+        external = removal.classify_mounts([{'target': '/sys/fs/cgroup', 'fstype': 'cgroup2'}],
+                                          True, owned_cilium=True)
+        self.assertEqual(external['cleanup_mounts'], [])
+        self.assertEqual(external['runtime_mounts'], [])
 
     def test_runtime_mount_classification_and_sanitized_diagnostics(self):
         mounts = [
@@ -424,6 +513,8 @@ class ActionModule(ActionBase):
         active = kill_count < v.get('fixture_process_clear_after', 0)
         protected = {'target': '/var/lib/longhorn', 'fstype': 'ext4', 'classification': 'protected_longhorn'}
         mount = {'target': '/var/lib/kubelet/pods/fixture/shm', 'fstype': 'tmpfs', 'classification': 'runtime'}
+        if v.get('fixture_cilium_mount', False):
+            mount = {'target': '/run/cilium/cgroupv2', 'fstype': 'cgroup2', 'classification': 'runtime'}
         storage = {'uuid': 'protected-disk', 'fstab': 'original', 'mounts': [protected]}
         if v.get('fixture_retry_storage_change', False) and kill_count:
             storage['fstab'] = 'changed'
@@ -544,6 +635,35 @@ class OrchestrationTests(unittest.TestCase):
                         if e['host'] == host and e['operation'] == 'ansible.builtin.command']
             self.assertEqual(commands, [scripts['killall'], scripts['killall'], scripts['uninstall']])
         self.assertIn('protected_longhorn', output)
+
+    def test_cilium_mount_release_and_persistent_failure(self):
+        scripts = {'killall': '/fixture/rke2-killall.sh', 'uninstall': '/fixture/rke2-uninstall.sh'}
+        for clears_after in (1, 2, None):
+            with self.subTest(clears_after=clears_after):
+                variables = {'fixture_scripts': scripts, 'fixture_cilium_mount': True}
+                if clears_after is None:
+                    variables['fixture_mount_residual'] = True
+                else:
+                    variables['fixture_clear_after'] = clears_after
+                rc, output, events = self.run_case(variables)
+                self.assertEqual(rc, 2 if clears_after is None else 0, output)
+                self.assertNotIn('fixture-secret', output)
+                self.assertFalse(any(e['operation'] == 'ansible.builtin.file'
+                                     and e['arguments']['path'].startswith('/var/lib/longhorn') for e in events))
+                if clears_after is None:
+                    commands = [e['arguments']['argv'][0] for e in events
+                                if e['operation'] == 'ansible.builtin.command']
+                    self.assertEqual(commands, [scripts['killall']] * 3)
+                    self.assertFalse(any(e['operation'] == 'ansible.builtin.file' for e in events))
+                    self.assertEqual({e['host'] for e in events}, {'worker'})
+                    self.assertIn('/run/cilium/cgroupv2', output)
+                    self.assertIn('cgroup2', output)
+                    self.assertIn('INCOMPLETE', output)
+                else:
+                    for host in ('worker', 'extra', 'cp'):
+                        commands = [e['arguments']['argv'][0] for e in events
+                                    if e['host'] == host and e['operation'] == 'ansible.builtin.command']
+                        self.assertEqual(commands, [scripts['killall']] * clears_after + [scripts['uninstall']])
 
     def test_persistent_runtime_mounts_exhaust_bound_without_uninstalling(self):
         scripts = {'killall': '/fixture/rke2-killall.sh', 'uninstall': '/fixture/rke2-uninstall.sh'}

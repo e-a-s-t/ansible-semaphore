@@ -88,7 +88,7 @@ def environment_content_reason(content):
     return None
 
 
-def classify_mounts(mounts, owned_runtime):
+def classify_mounts(mounts, owned_runtime, owned_cilium=False):
     """Classify mounts without exempting any mounted deletion path from guards.
 
     Pod volume bind mounts remain runtime blockers even when backed by the same
@@ -108,8 +108,12 @@ def classify_mounts(mounts, owned_runtime):
         pod = target.startswith('/var/lib/kubelet/pods/')
         runtime_tree = any(target == p or target.startswith(p + '/') for p in (
             '/run/k3s', '/run/rke2', '/var/lib/rancher/rke2/agent/containerd'))
-        runtime = owned_runtime and (pod or (namespace and fstype == 'nsfs') or
-                                    (runtime_tree and fstype in ('tmpfs', 'overlay', 'nsfs')))
+        # cgroup2 is never accepted through the generic pod/runtime rules.
+        # The exact Cilium target needs independent, trusted CNI evidence.
+        cilium_cgroup = owned_cilium and target == '/run/cilium/cgroupv2' and fstype == 'cgroup2'
+        runtime = owned_runtime and (cilium_cgroup or (fstype != 'cgroup2' and (
+            pod or (namespace and fstype == 'nsfs') or
+            (runtime_tree and fstype in ('tmpfs', 'overlay', 'nsfs')))))
         category = ('protected_longhorn' if protected else 'runtime' if runtime else
                     'persistent_storage' if fstype in ('ext4', 'xfs', 'btrfs', 'nfs', 'nfs4', 'ceph')
                     else 'unknown_mount')
@@ -274,17 +278,32 @@ def inspect(root='/', runner=probe):
             content = path(unit).read_text()
             if RUNTIME_OVERRIDE.search(content):
                 reasons.append('unsupported_runtime_paths')
+    cilium_evidence = False
+    cilium_configs = ('05-cilium.conflist', '05-cilium.conf')
     for conf in path('/etc/cni/net.d').glob('*'):
+        if conf.name in cilium_configs:
+            # Only exact, trusted on-node CNI files can associate the cgroup
+            # mount with this RKE2 runtime. Never follow symlink evidence.
+            metadata = conf.lstat()
+            if (unsafe('/etc/cni/net.d/' + conf.name) or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != 0 or metadata.st_mode & 0o022
+                    or not metadata.st_mode & 0o444):
+                reasons.append('untrusted_cilium_cni')
+                continue
         if conf.is_file():
-            if conf.name not in ('05-cilium.conflist', '05-cilium.conf', '10-canal.conflist', '10-flannel.conflist', '10-calico.conflist'):
+            if conf.name not in cilium_configs + ('10-canal.conflist', '10-flannel.conflist', '10-calico.conflist'):
                 reasons.append('unrecognized_cni')
             try:
                 cni = json.loads(conf.read_text())
-                plugins = cni.get('plugins', [cni])
+                plugins = cni.get('plugins', [cni]) if isinstance(cni, dict) else None
                 known = {'cilium-cni', 'calico', 'portmap', 'bandwidth', 'loopback', 'flannel', 'bridge', 'tuning'}
-                if not plugins or any(p.get('type') not in known for p in plugins):
+                valid = (isinstance(plugins, list) and bool(plugins)
+                         and all(isinstance(p, dict) and p.get('type') in known for p in plugins))
+                if not valid:
                     reasons.append('unrecognized_cni')
-            except (ValueError, AttributeError):
+                elif conf.name in cilium_configs and any(p['type'] == 'cilium-cni' for p in plugins):
+                    cilium_evidence = True
+            except (ValueError, OSError, UnicodeError):
                 reasons.append('unrecognized_cni')
     scripts = {}
     for name in ('uninstall', 'killall'):
@@ -303,7 +322,7 @@ def inspect(root='/', runner=probe):
         reasons.append('unrecognized_installation')
     if runtime and not evidence:
         reasons.append('unrecognized_runtime')
-    mount_state = classify_mounts(mounts, evidence and data)
+    mount_state = classify_mounts(mounts, evidence and data, owned_cilium=cilium_evidence)
     cleanup_mounts = mount_state['cleanup_mounts']
     for mount in mount_state['blocking_storage_mounts']:
         reasons.append('persistent_mount_in_cleanup_path' if mount['classification'] == 'persistent_storage'
