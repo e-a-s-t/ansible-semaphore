@@ -7,6 +7,9 @@
   vars_files:
     - ../vars/rke2.yml
   pre_tasks:
+    - name: Prepare controller-local execution
+      ansible.builtin.include_tasks: ../tasks/rke2-controller.yml
+
     - name: Initialize current-run cluster readiness
       ansible.builtin.set_fact:
         rke2_target_hosts: "{{ ansible_play_hosts_all }}"
@@ -23,6 +26,7 @@
     - name: Reset every targeted host readiness for this run
       ansible.builtin.set_fact:
         rke2_preflight_ready: false
+        rke2_installation_complete: false
       delegate_to: "{{ item }}"
       delegate_facts: true
       run_once: true
@@ -463,6 +467,11 @@
         - not ansible_check_mode
       no_log: true
 
+    - name: Record successful node installation or preservation
+      ansible.builtin.set_fact:
+        rke2_installation_complete: true
+      when: not ansible_check_mode
+
 - name: Join worker nodes
   any_errors_fatal: true
   hosts: worker
@@ -569,6 +578,11 @@
         - rke2_state in ['new', 'incomplete_install']
         - not ansible_check_mode
 
+    - name: Record successful node installation or preservation
+      ansible.builtin.set_fact:
+        rke2_installation_complete: true
+      when: not ansible_check_mode
+
 - name: Verify API and extract kubeconfig
   hosts: localhost
   connection: local
@@ -578,6 +592,10 @@
   vars_files:
     - ../vars/rke2.yml
   tasks:
+    - name: Enforce installation prerequisites before verification
+      ansible.builtin.include_tasks: ../tasks/rke2-verification-barrier.yml
+      when: not ansible_check_mode
+
     - name: Wait for the Kubernetes API endpoint
       ansible.builtin.uri:
         url: "https://{{ rke2_api_endpoint }}:{{ rke2_api_port }}/version"
@@ -591,6 +609,7 @@
       when: not ansible_check_mode
 
     - name: Verify registered Kubernetes nodes from a healthy control-plane member
+      become: true
       ansible.builtin.command: >-
         /usr/local/bin/rke2 kubectl
         --kubeconfig /etc/rancher/rke2/rke2.yaml
@@ -611,6 +630,7 @@
       when: not ansible_check_mode
 
     - name: Read admin kubeconfig from the selected healthy control-plane member
+      become: true
       ansible.builtin.slurp:
         src: /etc/rancher/rke2/rke2.yaml
       delegate_to: "{{ rke2_token_source_node | trim if rke2_token_source_node | trim else rke2_bootstrap_node }}"

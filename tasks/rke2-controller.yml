@@ -1,0 +1,22 @@
+---
+# add_host is a controller action: it needs neither a connection nor module staging.
+# Apply before delegation so alternative Semaphore inventories are safe too.
+- name: Configure controller execution for this run
+  ansible.builtin.add_host:
+    name: localhost
+    ansible_connection: local
+    ansible_become: false
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    ansible_remote_tmp: "{{ rke2_controller_remote_tmp }}"
+  changed_when: false
+  run_once: true
+
+- name: Protect controller module staging directory
+  ansible.builtin.file:
+    path: "{{ rke2_controller_remote_tmp }}"
+    state: directory
+    mode: '0700'
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: not ansible_check_mode

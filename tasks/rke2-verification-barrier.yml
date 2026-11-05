@@ -1,0 +1,13 @@
+---
+- name: Enforce cluster readiness before final verification
+  ansible.builtin.include_tasks: rke2-barrier.yml
+  vars:
+    rke2_require_token: true
+    rke2_require_bootstrap: true
+
+- name: Require successful installation of every original targeted node
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].rke2_installation_complete | default(false) | bool
+    fail_msg: "Installation prerequisites failed; API verification and kubeconfig extraction are blocked."
+  loop: "{{ hostvars['localhost'].rke2_target_hosts | default([]) }}"

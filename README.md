@@ -226,3 +226,24 @@ ansible-playbook tests/rke2_check_mode.yml --check
 Negative cases deliberately exercise failed assertions and rescue them. The
 multi-host Python test expects Ansible to reject its deliberately failed hosts.
 These checks use local fixtures and do not connect to lab nodes.
+
+### Semaphore controller execution
+
+RKE2 controller tasks explicitly use the local connection and run as the Semaphore
+process user. Root access remains enabled only for operations on cluster nodes.
+The playbook establishes localhost settings before delegation, including when
+Semaphore supplies its own inventory.
+
+Ansible controller scratch space defaults to `/tmp/ansible-semaphore-local`;
+Ansible creates private per-process directories there. Set `ANSIBLE_LOCAL_TEMP`
+in the Semaphore environment to override this base. Controller module staging
+uses `rke2_controller_remote_tmp`, defaulting to
+`/tmp/ansible-semaphore-<uid>/remote`, with mode `0700`. Set that variable through
+Semaphore extra vars if a different writable location is needed. Remote-node
+SSH connections and their temporary-directory settings remain independent.
+
+Token backups retain their configured persistent destination, directory mode
+`0700`, and file mode `0600`; temporary storage does not replace token backups.
+API verification and kubeconfig extraction require current-run bootstrap and token
+readiness plus successful completion of every targeted node. Failures block those
+operations even if Ansible continues into later plays.

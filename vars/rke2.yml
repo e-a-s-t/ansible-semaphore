@@ -26,3 +26,6 @@ rke2_artifact_timeout: 20
 rke2_installer_diagnostic_limit: 4000
 rke2_api_wait_retries: 60
 rke2_api_wait_delay: 5
+
+# Only controller module staging uses this path; remote nodes retain their SSH settings.
+rke2_controller_remote_tmp: "/tmp/ansible-semaphore-{{ lookup('pipe', 'id -u') }}/remote"
