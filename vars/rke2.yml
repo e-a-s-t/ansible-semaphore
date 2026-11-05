@@ -31,3 +31,6 @@ rke2_api_wait_delay: 5
 
 # Only controller module staging uses this path; remote nodes retain their SSH settings.
 rke2_controller_remote_tmp: "/tmp/ansible-semaphore-{{ lookup('pipe', 'id -u') }}/remote"
+
+# Destructive removal requires an explicit boolean override at execution time.
+rke2_remove_confirm: false

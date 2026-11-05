@@ -1,6 +1,6 @@
 # Ansible Semaphore Connectivity, RKE2 Validation, and Installation
 
-Ansible content for verifying Semaphore connectivity, validating Linux VMs, preparing nodes, and installing an idempotent RKE2 cluster.
+Ansible content for verifying Semaphore connectivity, validating Linux VMs, preparing nodes, installing RKE2, and safely removing it for rebuilds.
 
 ## Repository structure
 
@@ -104,7 +104,17 @@ The playbook does not gather facts during the initial connection step. It first 
 Run the stages in this order:
 
 ```text
-connectivity.yml -> prerequisites.yml -> prepare-nodes.yml -> install-rke2.yml
+1. Connectivity
+       |
+2. Prerequisites
+       |
+3. Prepare Nodes
+       |
+4. Install RKE2
+       |
+5. Remove RKE2
+       |
+       +----> 4. Install RKE2
 ```
 
 `install-rke2.yml` is intentionally separate from operating-system preparation and later platform components. It targets only `control_plane` and `worker` and requires root privileges.
@@ -313,3 +323,68 @@ After successful migration, securely update only the `ingress-controller` field
 to `none` in each existing `.carekube-managed-config` JSON marker. Remove the
 temporary extra variable and rerun the playbook. All other differences still
 require review; do not bypass drift checks or recreate markers blindly.
+
+
+## Remove RKE2 and rebuild
+
+Create a Semaphore task template named **5. Remove RKE2**, using playbook
+`playbooks/remove-rke2.yml` and inventory `inventories/lab/hosts.yml`.
+Supply the boolean confirmation explicitly in the execution's extra variables:
+
+```json
+{"rke2_remove_confirm": true}
+```
+
+The default is false. Never put destructive authorization in inventory. Running
+this template alone does not authorize removal. The command-line equivalent is:
+
+```bash
+ansible-playbook -i inventories/lab/hosts.yml playbooks/remove-rke2.yml \
+  -e '{"rke2_remove_confirm": true}'
+```
+
+For inspection without changes, append `--check`; confirmation is still required.
+Check mode contacts the selected nodes for read-only inspection, reports `WOULD REMOVE`
+or `ABSENT`, and does not stop services, run cleanup scripts, or delete files.
+Implementation tests and syntax checks below do not contact lab nodes.
+
+Removal supports the standard Linux tarball layout used by this repository.
+Every inventory `worker` and `control_plane` node must be included and reachable;
+partial-cluster removal is rejected. `rke2_bootstrap_node` explicitly selects the
+last node removed. Workers are removed first, then additional control-plane nodes,
+then bootstrap, one node at a time. All nodes must pass preflight before removal
+starts. A failure halts later phases; previously removed nodes stay removed.
+
+The remover accepts recognized RKE2 installations, including installations without
+a Carekube marker, drifted configuration, and safely identifiable partial installs.
+It refuses foreign Kubernetes, ambiguous shared CNI/runtime state, unsupported
+custom runtime paths, and unsafe cleanup mounts or symlinks. Refused states require
+operator investigation; changing the confirmation does not bypass these checks.
+It uses installed official uninstall/runtime cleanup scripts when available and
+an inspected allowlist for remaining files. Missing scripts with runtime or CNI
+state require operator recovery rather than generic network deletion.
+
+Removal deletes RKE2 services, installation artifacts, configuration, certificates,
+credentials, embedded etcd, and owned runtime/CNI state. It preserves OS preparation,
+prerequisite packages, iSCSI, modules, sysctls, swap settings, SSH, dedicated disks,
+and `/var/lib/longhorn` with its persistent mount configuration. Disk identity,
+Longhorn mounts, and `/etc/fstab` are compared before and after cleanup. No disks
+are formatted or partitioned. Preserving Longhorn storage does not automatically
+restore its Kubernetes resources or recover volumes into a rebuilt cluster.
+
+A node reports `REMOVED` only after independent verification. An already removed
+node reports `ABSENT`; uninstall errors or remaining artifacts/storage changes
+produce `INCOMPLETE` and fail the run. After successful removal, run **4. Install
+RKE2** again on the prepared machines without recreating VMs or reinstalling the OS.
+
+Controller-side token backups (`rke2_token_backup_path`) and kubeconfigs
+(`rke2_kubeconfig_path`) are preserved for audit and recovery. These credentials
+may no longer work after rebuilding. Archive them securely before reinstalling,
+since installation writes the current cluster credentials to those paths.
+
+Offline removal checks (the fixtures never execute host cleanup):
+
+```bash
+ansible-playbook -i inventories/lab/hosts.yml playbooks/remove-rke2.yml --syntax-check
+python3 -m unittest discover -s tests -p 'test_rke2_*.py'
+```

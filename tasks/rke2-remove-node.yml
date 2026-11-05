@@ -1,0 +1,110 @@
+---
+- name: Enforce cluster-wide removal readiness
+  ansible.builtin.include_tasks: rke2-remove-barrier.yml
+
+- name: Remove and independently verify this node
+  when: not ansible_check_mode
+  block:
+    - name: Reinspect immediately before mutation
+      rke2_remove_inspect:
+      register: rke2_remove_current
+
+    - name: Require unchanged ownership and protected storage
+      ansible.builtin.assert:
+        that:
+          - rke2_remove_current.inspection.safe
+          - rke2_remove_current.inspection.storage == rke2_remove_before.inspection.storage
+        fail_msg: Removal preconditions changed; refusing cleanup.
+
+    - name: Stop recognized RKE2 services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      no_log: true
+      loop: [rke2-server, rke2-agent]
+      when:
+        - rke2_remove_current.inspection.present
+        - (item ~ '.service') in rke2_remove_current.inspection.remaining
+
+    - name: Run installed official runtime cleanup before uninstalling
+      ansible.builtin.command:
+        argv: ["{{ rke2_remove_current.inspection.scripts.killall }}"]
+      environment:
+        RKE2_DATA_DIR: /var/lib/rancher/rke2
+      when:
+        - rke2_remove_current.inspection.present
+        - "'killall' in rke2_remove_current.inspection.scripts"
+      no_log: true
+
+    - name: Inspect runtime shutdown before recursive file cleanup
+      rke2_remove_inspect:
+      register: rke2_remove_stopped
+      when: rke2_remove_current.inspection.present
+
+    - name: Refuse recursive cleanup while processes or mounted volumes remain
+      ansible.builtin.assert:
+        that:
+          - not rke2_remove_stopped.inspection.runtime_active
+          - rke2_remove_stopped.inspection.cleanup_mounts | length == 0
+          - rke2_remove_stopped.inspection.storage == rke2_remove_before.inspection.storage
+        fail_msg: Runtime shutdown is incomplete; mounted volumes will not be traversed.
+      when: rke2_remove_current.inspection.present
+
+    - name: Run installed official RKE2 uninstaller
+      ansible.builtin.command:
+        argv: ["{{ rke2_remove_current.inspection.scripts.uninstall }}"]
+      environment:
+        RKE2_DATA_DIR: /var/lib/rancher/rke2
+        INSTALL_RKE2_ROOT: /usr/local
+      when:
+        - rke2_remove_current.inspection.present
+        - "'uninstall' in rke2_remove_current.inspection.scripts"
+      no_log: true
+
+    - name: Remove only inspected RKE2-owned artifacts and partial installation remnants
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ rke2_remove_current.inspection.cleanup_paths }}"
+      when: rke2_remove_current.inspection.present
+
+    - name: Reload systemd after unit removal
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      no_log: true
+      when: rke2_remove_current.inspection.present
+
+  rescue:
+    - name: Record cleanup failure without logging script output
+      ansible.builtin.set_fact:
+        rke2_remove_failed: true
+
+  always:
+    - name: Inspect after removal even when uninstall fails
+      rke2_remove_inspect:
+      register: rke2_remove_after
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Determine verified node result
+      ansible.builtin.set_fact:
+        rke2_remove_result: >-
+          {{ 'INCOMPLETE' if (rke2_remove_failed | default(false)
+             or rke2_remove_after.failed | default(false)
+             or not rke2_remove_after.inspection.safe | default(false)
+             or rke2_remove_after.inspection.present | default(true)
+             or rke2_remove_after.inspection.storage | default({}) != rke2_remove_before.inspection.storage)
+             else ('REMOVED' if rke2_remove_before.inspection.present else 'ABSENT') }}
+      when: not ansible_check_mode
+
+    - name: Report verified removal result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} | {{ 'control_plane' if 'control_plane' in group_names else 'worker' }} | {{ rke2_remove_result }}"
+      when: not ansible_check_mode
+
+    - name: Stop cluster teardown after incomplete cleanup
+      ansible.builtin.assert:
+        that: rke2_remove_result != 'INCOMPLETE'
+        fail_msg: RKE2 cleanup or storage verification failed; later nodes will not be removed.
+      when: not ansible_check_mode

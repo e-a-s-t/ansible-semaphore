@@ -1,0 +1,7 @@
+---
+- name: Require every inventory node to have passed this run's preflight
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].rke2_remove_ready | default(false) | bool
+    fail_msg: Removal blocked because a cluster node did not pass preflight.
+  loop: "{{ groups['control_plane'] | union(groups['worker'] | default([])) }}"

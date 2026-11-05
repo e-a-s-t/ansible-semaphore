@@ -1,0 +1,83 @@
+---
+- name: Authorize and inspect the complete RKE2 cluster before any mutation
+  hosts: "{{ (groups['control_plane'] | default([]) | union(groups['worker'] | default([]))) or ['localhost'] }}"
+  gather_facts: false
+  strategy: linear
+  any_errors_fatal: true
+  become: true
+  vars_files: [../vars/rke2.yml]
+  tasks:
+    - name: Reset current-run removal readiness
+      ansible.builtin.set_fact:
+        rke2_remove_ready: false
+        rke2_remove_failed: false
+
+    - name: Require explicit authorization and complete inventory scope
+      ansible.builtin.assert:
+        that:
+          - rke2_remove_confirm is boolean
+          - rke2_remove_confirm
+          - groups['control_plane'] | default([]) | length > 0
+          - rke2_bootstrap_node in groups['control_plane']
+          - ansible_play_hosts_all | sort == (groups['control_plane'] | union(groups['worker'] | default([])) | sort)
+          - (group_names | intersect(['control_plane', 'worker']) | length) == 1
+          - inventory_hostname not in ['localhost', '127.0.0.1', '::1']
+          - ansible_connection | default('ssh') != 'local'
+          - ansible_host | default(inventory_hostname) not in ['localhost', '127.0.0.1', '::1']
+          - rke2_config_path == '/etc/rancher/rke2/config.yaml'
+          - rke2_data_dir == '/var/lib/rancher/rke2'
+          - rke2_managed_marker == '/etc/rancher/rke2/.carekube-managed-config'
+        fail_msg: >-
+          Removal requires boolean rke2_remove_confirm=true, the full cluster inventory,
+          disjoint node roles, an explicit bootstrap, remote nodes, and standard RKE2 paths.
+
+    - name: Inspect RKE2 ownership and protected storage
+      rke2_remove_inspect:
+      register: rke2_remove_before
+
+    - name: Refuse foreign or ambiguous installation state
+      ansible.builtin.assert:
+        that: rke2_remove_before.inspection.safe
+        fail_msg: "Removal refused: {{ rke2_remove_before.inspection.reasons }}"
+
+    - name: Record successful current-run preflight
+      ansible.builtin.set_fact:
+        rke2_remove_ready: true
+
+    - name: Report check-mode removal plan
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} |
+          {{ 'WOULD REMOVE' if rke2_remove_before.inspection.present else 'ABSENT' }} |
+          RKE2 {{ 'server' if 'control_plane' in group_names else 'agent' }}
+      when: ansible_check_mode
+
+- name: Remove workers first
+  hosts: worker
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  vars_files: [../vars/rke2.yml]
+  tasks:
+    - ansible.builtin.include_tasks: ../tasks/rke2-remove-node.yml
+
+- name: Remove additional control-plane nodes second
+  hosts: "{{ groups['control_plane'] | default([]) | difference([rke2_bootstrap_node]) }}"
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  vars_files: [../vars/rke2.yml]
+  tasks:
+    - ansible.builtin.include_tasks: ../tasks/rke2-remove-node.yml
+
+- name: Remove explicit bootstrap last
+  hosts: "{{ rke2_bootstrap_node }}"
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  vars_files: [../vars/rke2.yml]
+  tasks:
+    - ansible.builtin.include_tasks: ../tasks/rke2-remove-node.yml
