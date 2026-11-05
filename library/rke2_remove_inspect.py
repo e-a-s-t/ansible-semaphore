@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import stat
 import subprocess
 
 ROOTS = ('/usr/local', '/usr', '/opt/rke2')
@@ -23,8 +25,16 @@ OWNED = ('/etc/rancher/rke2', '/var/lib/rancher/rke2', '/run/rke2', '/run/k3s',
          '/run/flannel', '/run/cilium', '/var/lib/cilium')
 SHARED = OWNED[4:]
 UNITS += tuple('/etc/systemd/system/multi-user.target.wants/rke2-' + role + '.service' for role in ('server', 'agent'))
-ENVS = tuple(root + '/rke2-' + role for root in ('/etc/default', '/etc/sysconfig') for role in ('server', 'agent'))
-ARTIFACTS = BINS + UNITS + ENVS + OWNED + tuple(root + '/share/rke2' for root in ROOTS)
+# The upstream tarball units reference all three locations, optionally. Keep
+# reference validation, content checks and cleanup on this same explicit list.
+ENVS = tuple(root + '/rke2-' + role + suffix
+             for root, suffix in (('/etc/default', ''), ('/etc/sysconfig', ''),
+                                  ('/usr/local/lib/systemd/system', '.env'))
+             for role in ('server', 'agent'))
+RUNTIME_OVERRIDE = re.compile(
+    r'--(data-dir|root-dir|container-runtime-endpoint|config)([= \t]|$)|'
+    r'RKE2_(DATA_DIR|CONFIG_FILE|KUBELET_ARG)\s*=')
+ARTIFACTS = tuple(dict.fromkeys(BINS + UNITS + ENVS + OWNED + tuple(root + '/share/rke2' for root in ROOTS)))
 FOREIGN = ('/etc/kubernetes', '/var/lib/etcd', '/var/lib/rancher/k3s',
            '/etc/rancher/k3s', '/var/snap/microk8s', '/var/lib/k0s')
 
@@ -32,6 +42,50 @@ FOREIGN = ('/etc/kubernetes', '/var/lib/etcd', '/var/lib/rancher/k3s',
 def probe(argv):
     result = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
     return result.returncode, result.stdout
+
+
+def diagnostic_path(value):
+    """Escape controls, bound output and discard URL-like credential suffixes."""
+    value = re.split(r'[?#]', value, maxsplit=1)[0]
+    return json.dumps(value[:256], ensure_ascii=True)[1:-1][:256]
+
+
+def environment_references(value):
+    """Parse systemctl show's path (ignore_errors=yes/no) records, fail closed.
+
+    No shell expansion or path normalization: only exact allowlisted paths can
+    pass validation, including when systemd escapes a nonstandard path.
+    """
+    records = []
+    remaining = value.strip()
+    while remaining:
+        match = re.match(r'(/[^\s()]+)\s+\(ignore_errors=(yes|no)\)(?:\s+|$)', remaining)
+        if not match:
+            candidate = re.match(r'/[^\s()]+', remaining)
+            return records, candidate.group() if candidate else '<unparsed>'
+        records.append((match.group(1), match.group(2) == 'yes'))
+        remaining = remaining[match.end():]
+    return records, None
+
+
+def environment_content_reason(content):
+    """Inspect assignments as data; never source files or return their values."""
+    if RUNTIME_OVERRIDE.search(content):
+        return 'runtime_path_override'
+    try:
+        lexer = shlex.shlex(content, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = '#;'
+        for assignment in lexer:
+            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', assignment):
+                return 'malformed_contents'
+            key = assignment.split('=', 1)[0]
+            if key in ('RKE2_DATA_DIR', 'RKE2_CONFIG_FILE', 'RKE2_KUBELET_ARG',
+                       'RKE2_CONTAINER_RUNTIME_ENDPOINT', 'LD_PRELOAD', 'LD_LIBRARY_PATH'):
+                return 'runtime_path_override'
+    except ValueError:
+        return 'malformed_contents'
+    return None
 
 
 def inspect(root='/', runner=probe):
@@ -90,6 +144,16 @@ def inspect(root='/', runner=probe):
     storage = {'mounts': protected, 'disks': json.loads(disks),
                'fstab': hashlib.sha256(path('/etc/fstab').read_bytes()).hexdigest()}
     reasons = []
+    environment_diagnostics = []
+
+    def reject_environment(service, env_path, reason):
+        reasons.append('unsupported_environment_file')
+        if reason == 'runtime_path_override':
+            reasons.append('unsupported_runtime_paths')
+        environment_diagnostics.append({'service': service + '.service',
+                                        'path': diagnostic_path(env_path), 'reason': reason})
+
+    references = {}
     if foreign:
         reasons.append('foreign_kubernetes')
     for name in ('rke2-server', 'rke2-agent'):
@@ -97,14 +161,46 @@ def inspect(root='/', runner=probe):
         if props.get('DropInPaths', ''):
             reasons.append('unsupported_service_overrides')
         effective = props.get('ExecStart', '') + ' ' + props.get('Environment', '')
-        if re.search(r'--(data-dir|root-dir|container-runtime-endpoint|config)([= \t]|$)|RKE2_(DATA_DIR|CONFIG_FILE|KUBELET_ARG)=', effective):
+        if RUNTIME_OVERRIDE.search(effective):
             reasons.append('unsupported_runtime_paths')
         executable = re.search(r'path=([^ ;]+)', props.get('ExecStart', ''))
         if executable and executable.group(1) != '/usr/local/bin/rke2':
             reasons.append('unsupported_service_executable')
-        for env_path in re.findall(r'/[^ ;()]+', props.get('EnvironmentFiles', '')):
+        records, malformed = environment_references(props.get('EnvironmentFiles', ''))
+        if malformed is not None:
+            reject_environment(name, malformed, 'malformed_reference')
+        for env_path, optional in records:
             if env_path not in ENVS:
-                reasons.append('unsupported_environment_file')
+                reject_environment(name, env_path, 'unexpected_path')
+                continue
+            references.setdefault(env_path, []).append((name, optional))
+
+    # Inspect supported files even if a partial installation has no loaded unit.
+    # Missing optional references remain valid and are not cleanup artifacts.
+    for env_path in ENVS:
+        consumers = references.get(env_path, [(Path(env_path).name.split('.')[0], True)])
+        reason = None
+        if unsafe(env_path):
+            reason = 'symlink_path'
+        elif not exists(env_path):
+            if any(not optional for _, optional in consumers):
+                reason = 'missing_required_file'
+        else:
+            try:
+                metadata = path(env_path).lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    reason = 'not_regular_file'
+                elif metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                    reason = 'unsafe_ownership_or_permissions'
+                elif not metadata.st_mode & 0o444:
+                    reason = 'unreadable_file'
+                else:
+                    reason = environment_content_reason(path(env_path).read_text())
+            except (OSError, UnicodeError):
+                reason = 'unreadable_file'
+        if reason:
+            for service, _ in consumers:
+                reject_environment(service, env_path, reason)
     if any(unsafe(p) for p in OWNED + BINS):
         reasons.append('unsafe_cleanup_path')
     cleanup_mounts = [m['target'] for m in mounts
@@ -148,10 +244,10 @@ def inspect(root='/', runner=probe):
             reasons.append('unsupported_runtime_paths')
     if nonempty('/etc/rancher/rke2/config.yaml.d'):
         reasons.append('unsupported_config_fragments')
-    for unit in UNITS + ENVS:
-        if exists(unit) and path(unit).is_file():
+    for unit in UNITS:
+        if unit not in ENVS and exists(unit) and path(unit).is_file():
             content = path(unit).read_text()
-            if re.search(r'--(data-dir|root-dir|container-runtime-endpoint|config)([= \t]|$)|RKE2_(DATA_DIR|CONFIG_FILE|KUBELET_ARG)=', content):
+            if RUNTIME_OVERRIDE.search(content):
                 reasons.append('unsupported_runtime_paths')
     for conf in path('/etc/cni/net.d').glob('*'):
         if conf.is_file():
@@ -213,7 +309,8 @@ def inspect(root='/', runner=probe):
                          + (['runtime_processes'] if runtime else []) + network + pins + helpers + cleanup_mounts,
             'role': 'server' if server or exists('/var/lib/rancher/rke2/server') else 'agent' if agent else 'unknown',
             'scripts': scripts, 'cleanup_paths': present + helpers + pins,
-            'storage': storage, 'cleanup_mounts': cleanup_mounts, 'runtime_active': runtime}
+            'storage': storage, 'cleanup_mounts': cleanup_mounts, 'runtime_active': runtime,
+            'environment_diagnostics': environment_diagnostics}
 
 
 def main():

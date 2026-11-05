@@ -14,7 +14,9 @@
         that:
           - rke2_remove_current.inspection.safe
           - rke2_remove_current.inspection.storage == rke2_remove_before.inspection.storage
-        fail_msg: Removal preconditions changed; refusing cleanup.
+        fail_msg: >-
+          Removal preconditions changed; refusing cleanup.
+          Environment files={{ rke2_remove_current.inspection.environment_diagnostics | default([]) }}
 
     - name: Stop recognized RKE2 services
       ansible.builtin.systemd_service:
@@ -102,6 +104,13 @@
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} | {{ 'control_plane' if 'control_plane' in group_names else 'worker' }} | {{ rke2_remove_result }}"
       when: not ansible_check_mode
+
+    - name: Report sanitized environment-file verification failures
+      ansible.builtin.debug:
+        msg: "{{ rke2_remove_after.inspection.environment_diagnostics | default([]) }}"
+      when:
+        - not ansible_check_mode
+        - rke2_remove_result == 'INCOMPLETE'
 
     - name: Stop cluster teardown after incomplete cleanup
       ansible.builtin.assert:

@@ -21,6 +21,20 @@ class InspectionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir='/private/tmp')
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.environment_uids = {}
+        original_lstat = Path.lstat
+
+        def fixture_lstat(path, *args, **kwargs):
+            metadata = original_lstat(path, *args, **kwargs)
+            if str(path) in self.environment_uids:
+                fields = list(metadata)
+                fields[4] = self.environment_uids[str(path)]
+                return os.stat_result(fields)
+            return metadata
+
+        ownership = patch.object(Path, 'lstat', fixture_lstat)
+        ownership.start()
+        self.addCleanup(ownership.stop)
         self.services = {}
         self.service_properties = {}
         self.processes = ''
@@ -63,9 +77,155 @@ class InspectionTests(unittest.TestCase):
         self.write('/etc/rancher/rke2/.carekube-managed-config', '{"cluster-init": true}')
         self.write('/var/lib/rancher/rke2/' + ('server' if role == 'server' else 'agent') + '/state')
         self.services['rke2-' + role] = ('loaded', 'active')
+        # Mirror the three optional EnvironmentFile directives in upstream units.
+        env_paths = [f'/etc/default/rke2-{role}', f'/etc/sysconfig/rke2-{role}',
+                     f'/usr/local/lib/systemd/system/rke2-{role}.env']
+        self.service_properties['rke2-' + role] = (
+            'ExecStart={ path=/usr/local/bin/rke2 ; argv[]=/usr/local/bin/rke2 ' + role + ' ; }\n'
+            'EnvironmentFiles=' + ' '.join(p + ' (ignore_errors=yes)' for p in env_paths))
+        self.write('/usr/local/lib/systemd/system/rke2-' + role + '.service',
+                   '[Service]\n' + ''.join('EnvironmentFile=-' + p + '\n' for p in env_paths)
+                   + 'ExecStart=/usr/local/bin/rke2 ' + role + '\n')
         if scripts:
             for name in ('uninstall', 'killall'):
                 self.write('/usr/local/bin/rke2-' + name + '.sh', '#!/bin/sh\n# rke2 fixture\n')
+
+    def write_environment(self, path, content='RKE2_TOKEN="fixture-secret"\nHTTP_PROXY=http://proxy.invalid:3128\n'):
+        result = self.write(path, content)
+        self.environment_uids[str(result)] = 0
+        return result
+
+    def test_standard_server_and_agent_environment_files(self):
+        for role in ('server', 'agent'):
+            with self.subTest(role=role):
+                self.install(role=role, scripts=False)
+                # systemctl lists optional files even if none of them exist.
+                self.assertTrue(self.inspect()['safe'])
+                files = [f'/etc/default/rke2-{role}', f'/etc/sysconfig/rke2-{role}',
+                         f'/usr/local/lib/systemd/system/rke2-{role}.env']
+                for filename in files:
+                    self.write_environment(filename)
+                inspected = self.inspect()
+                self.assertTrue(inspected['safe'], inspected['environment_diagnostics'])
+                self.assertEqual(inspected['environment_diagnostics'], [])
+                self.assertTrue(set(files) <= set(inspected['cleanup_paths']))
+                self.assertEqual(len(inspected['cleanup_paths']), len(set(inspected['cleanup_paths'])))
+                self.assertNotIn('fixture-secret', str(inspected))
+
+    def test_environment_required_missing_and_present(self):
+        self.install(scripts=False)
+        filename = '/usr/local/lib/systemd/system/rke2-server.env'
+        self.service_properties['rke2-server'] = 'EnvironmentFiles=' + filename + ' (ignore_errors=no)'
+        self.assertEqual(self.inspect()['environment_diagnostics'], [
+            {'service': 'rke2-server.service', 'path': filename, 'reason': 'missing_required_file'}])
+        self.write_environment(filename)
+        self.assertTrue(self.inspect()['safe'])
+
+    def test_unexpected_and_malformed_environment_references(self):
+        self.install(scripts=False)
+        for value, filename, reason in (
+            ('/custom/environment (ignore_errors=yes)', '/custom/environment', 'unexpected_path'),
+            ('/etc/default/../foreign (ignore_errors=yes)', '/etc/default/../foreign', 'unexpected_path'),
+            ('/custom/environment (ignore_errors=unknown)', '/custom/environment', 'malformed_reference'),
+            ('/custom/environment', '/custom/environment', 'malformed_reference'),
+            ('RKE2_TOKEN=fixture-secret', '<unparsed>', 'malformed_reference'),
+        ):
+            with self.subTest(value=value):
+                self.service_properties['rke2-server'] = 'EnvironmentFiles=' + value
+                result = self.inspect()
+                self.assertFalse(result['safe'])
+                self.assertIn('unsupported_environment_file', result['reasons'])
+                self.assertEqual(result['environment_diagnostics'][0]['path'], filename)
+                self.assertEqual(result['environment_diagnostics'][0]['reason'], reason)
+                self.assertNotIn('fixture-secret', str(result))
+
+    def test_environment_symlinks_and_parent_symlinks(self):
+        self.install(scripts=False)
+        filename = '/etc/default/rke2-server'
+        target = self.write('/outside', 'RKE2_TOKEN=fixture-secret')
+        link = self.root / filename.lstrip('/')
+        link.parent.mkdir(parents=True)
+        link.symlink_to(target)
+        self.assertEqual(self.inspect()['environment_diagnostics'][0]['reason'], 'symlink_path')
+        link.unlink()
+        link.parent.rmdir()
+        directory = self.root / 'other'
+        directory.mkdir()
+        link.parent.symlink_to(directory, target_is_directory=True)
+        self.assertEqual(self.inspect()['environment_diagnostics'][0]['reason'], 'symlink_path')
+        self.assertEqual(target.read_text(), 'RKE2_TOKEN=fixture-secret')
+
+    def test_environment_permissions_types_and_unreadable_contents(self):
+        self.install(scripts=False)
+        filename = '/usr/local/lib/systemd/system/rke2-server.env'
+        env = self.write_environment(filename)
+        for mode, reason in ((0o666, 'unsafe_ownership_or_permissions'), (0o000, 'unreadable_file')):
+            env.chmod(mode)
+            self.assertEqual(self.inspect()['environment_diagnostics'][0]['reason'], reason)
+        env.chmod(0o600)
+        self.environment_uids[str(env)] = 12345
+        self.assertEqual(self.inspect()['environment_diagnostics'][0]['reason'], 'unsafe_ownership_or_permissions')
+        self.environment_uids[str(env)] = 0
+        original_read = Path.read_text
+
+        def unreadable(path, *args, **kwargs):
+            if path == env:
+                raise PermissionError('fixture-secret')
+            return original_read(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', unreadable):
+            result = self.inspect()
+            self.assertEqual(result['environment_diagnostics'][0]['reason'], 'unreadable_file')
+            self.assertNotIn('fixture-secret', str(result))
+        env.write_bytes(b'\xff')
+        self.assertEqual(self.inspect()['environment_diagnostics'][0]['reason'], 'unreadable_file')
+        env.unlink()
+        env.mkdir()
+        self.assertEqual(self.inspect()['environment_diagnostics'][0]['reason'], 'not_regular_file')
+
+    def test_environment_unsafe_contents_never_leak_values(self):
+        self.install(scripts=False)
+        filename = '/usr/local/lib/systemd/system/rke2-server.env'
+        for content, reason in (
+            ('RKE2_DATA_DIR=/var/lib/longhorn\nRKE2_TOKEN=fixture-secret', 'runtime_path_override'),
+            ('RKE2_CONFIG_FILE = /custom', 'runtime_path_override'),
+            ('"RKE2_KUBELET_ARG=--root-dir=/custom"', 'runtime_path_override'),
+            ('LD_PRELOAD=/custom/fixture-secret.so', 'runtime_path_override'),
+            ('RKE2_TOKEN="fixture-secret', 'malformed_contents'),
+            ('touch /tmp/fixture-secret', 'malformed_contents'),
+        ):
+            with self.subTest(reason=reason):
+                self.write_environment(filename, content)
+                result = self.inspect()
+                self.assertFalse(result['safe'])
+                self.assertEqual(result['environment_diagnostics'][0]['reason'], reason)
+                self.assertNotIn('fixture-secret', str(result))
+
+    def test_environment_cleanup_remnants_and_repeat_absence(self):
+        filename = '/usr/local/lib/systemd/system/rke2-server.env'
+        self.write_environment(filename)
+        self.assertFalse(self.inspect()['safe'])  # An env file alone is not ownership evidence.
+        self.write('/etc/rancher/rke2/.carekube-managed-config', '{"cluster-init":true}')
+        result = self.inspect()
+        self.assertTrue(result['safe'])
+        self.assertIn(filename, result['remaining'])
+        # Apply only the production inspector's allowlist to this temporary fixture root.
+        for name in result['cleanup_paths']:
+            target = self.root / name.lstrip('/')
+            if target.is_dir():
+                import shutil
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+        for _ in range(2):
+            after = self.inspect()
+            self.assertFalse(after['present'])
+            self.assertTrue(after['safe'])
+
+    def test_diagnostic_paths_are_bounded_escaped_and_redacted(self):
+        self.assertEqual(removal.diagnostic_path('/custom/\n\x1b[31m'), '/custom/\\n\\u001b[31m')
+        self.assertNotIn('fixture-secret', removal.diagnostic_path('/custom?token=fixture-secret'))
+        self.assertLessEqual(len(removal.diagnostic_path('/' + 'x' * 1000)), 256)
 
     def test_already_absent_and_storage_snapshot(self):
         result = self.inspect()
@@ -193,13 +353,16 @@ class ActionModule(ActionBase):
         if host == v.get('fixture_unreachable_host', ''):
             return {'unreachable': True, 'msg': 'fixture unreachable'}
         after = self._task.name.startswith('Inspect after')
+        phase = 'after' if after else ('current' if self._task.name.startswith('Reinspect') else 'before')
+        unsafe = host == v.get('fixture_unsafe_host', '') or phase == v.get('fixture_unsafe_phase', '')
         present = v.get('fixture_present', True) and (not after or v.get('fixture_residual', False))
         storage = {'uuid': 'protected-disk', 'fstab': 'original'}
         if after and v.get('fixture_storage_change', False):
             storage['fstab'] = 'changed'
         role = 'server' if 'control_plane' in v['group_names'] else 'agent'
         return {'changed': False, 'inspection': {
-            'safe': host != v.get('fixture_unsafe_host', ''), 'reasons': ['fixture'],
+            'safe': not unsafe, 'reasons': ['fixture'],
+            'environment_diagnostics': v.get('fixture_environment_diagnostics', []) if unsafe else [],
             'present': present, 'remaining': ['rke2-' + role + '.service'] if present else [],
             'storage': storage, 'cleanup_paths': ['/fixture/rke2'],
             'runtime_active': False, 'cleanup_mounts': ['/fixture/mounted-volume'] if v.get('fixture_mount_residual', False) else [],
@@ -329,6 +492,23 @@ class OrchestrationTests(unittest.TestCase):
         rc, output, events = self.run_case({'fixture_unsafe_host': 'cp'})
         self.assertNotEqual(rc, 0, output)
         self.assertEqual(events, [])
+
+    def test_environment_diagnostics_and_failure_barriers(self):
+        filename = '/usr/local/lib/systemd/system/rke2-server.env'
+        diagnostic = [{'service': 'rke2-server.service', 'path': filename,
+                       'reason': 'runtime_path_override'}]
+        for phase in ('before', 'current', 'after'):
+            with self.subTest(phase=phase):
+                rc, output, events = self.run_case({'fixture_unsafe_phase': phase,
+                                                  'fixture_environment_diagnostics': diagnostic})
+                self.assertEqual(rc, 2, output)
+                self.assertIn(filename, output)
+                self.assertIn('runtime_path_override', output)
+                if phase in ('before', 'current'):
+                    self.assertEqual(events, [])
+                else:
+                    self.assertEqual({e['host'] for e in events}, {'worker'})
+                    self.assertIn('INCOMPLETE', output)
 
     def test_unreachable_preflight_blocks_mutation(self):
         rc, output, events = self.run_case({'fixture_unreachable_host': 'worker'})

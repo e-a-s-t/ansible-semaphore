@@ -371,6 +371,21 @@ It uses installed official uninstall/runtime cleanup scripts when available and
 an inspected allowlist for remaining files. Missing scripts with runtime or CNI
 state require operator recovery rather than generic network deletion.
 
+The standard RKE2 server and agent service units reference three optional
+environment files per service: `/etc/default/rke2-server` (or `rke2-agent`),
+`/etc/sysconfig/rke2-server` (or `rke2-agent`), and
+`/usr/local/lib/systemd/system/rke2-server.env` (or `rke2-agent.env`). These
+references come from the upstream tarball units installed by `install-rke2.yml`;
+our playbook does not create the files itself. A reference in `systemctl show`
+does not mean the optional file exists. Missing optional files are accepted.
+Existing files must be regular, root-owned, not group/world-writable, and have
+no symlink in their path. They are inspected as data, never sourced or executed.
+Unexpected paths, missing required files, malformed contents, and runtime-path
+overrides remain blocked. Recognized files are included in cleanup and absence
+verification. Environment refusals report the service, a bounded escaped file
+path, and a fixed reason such as `unexpected_path`, `symlink_path`, or
+`runtime_path_override`; environment values and credentials are never logged.
+
 Removal deletes RKE2 services, installation artifacts, configuration, certificates,
 credentials, embedded etcd, and owned runtime/CNI state. It preserves OS preparation,
 prerequisite packages, iSCSI, modules, sysctls, swap settings, SSH, dedicated disks,

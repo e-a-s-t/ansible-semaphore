@@ -41,7 +41,9 @@
     - name: Refuse foreign or ambiguous installation state
       ansible.builtin.assert:
         that: rke2_remove_before.inspection.safe
-        fail_msg: "Removal refused: {{ rke2_remove_before.inspection.reasons }}"
+        fail_msg: >-
+          Removal refused: {{ rke2_remove_before.inspection.reasons }};
+          environment files={{ rke2_remove_before.inspection.environment_diagnostics | default([]) }}
 
     - name: Record successful current-run preflight
       ansible.builtin.set_fact:
