@@ -10,6 +10,10 @@ Consequently, putting `rke2_version`, endpoints, or `prerequisites_data_disk_dev
 
 All tables describe repository defaults, not a claim that every listed value is independently configurable. No secrets are shown. See [Usage](Usage.md) and [Operations](Operations.md) for workflows.
 
+## Agent restart input
+
+`target_host` has no default. Pass an exact inventory alias in `worker` via CLI or Semaphore extra variables. Group names, patterns, non-string values, control-plane overlap, and a host limit excluding the target are rejected. See [Usage](Usage.md#restart-one-rke2-agent).
+
 ## RKE2 defaults
 
 Source: [vars/rke2.yml](../vars/rke2.yml). All entries have defaults, but environment-specific node/endpoints must be valid for the selected inventory. Authorization is required per removal execution.

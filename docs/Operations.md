@@ -236,3 +236,9 @@ since installation writes the current cluster credentials to those paths.
 | Removal `INCOMPLETE` | Inspect sanitized mount/storage/environment diagnostics and resolve the cause before a full-scope authorized retry. Previously removed nodes remain removed. |
 
 See [Configuration](Configuration.md), [Security](Security.md), and [test coverage](Testcases.md).
+
+## Agent restart troubleshooting
+
+Use [the single-worker restart workflow](Usage.md#restart-one-rke2-agent) when an explicit agent restart is needed. Selection failures require correcting `target_host`, inventory role membership, or the CLI/Semaphore host limit. A systemd or SSH/become failure is reported as a failed run; investigate target access and `sudo systemctl status rke2-agent` / `sudo journalctl -u rke2-agent` before retrying. Each retry requests another restart.
+
+After a successful restart, independently check Kubernetes node readiness and affected workload/storage health using your cluster credentials. This playbook does not perform those checks, drain/uncordon nodes, or promise recovery. No live restart validation is included in the offline suite.

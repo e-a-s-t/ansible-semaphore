@@ -16,7 +16,7 @@ This supplies the configured debug callback and mount module; it is not a pinned
 
 | Directory/file | Contents |
 |----------------|----------|
-| `playbooks/` | Five operational entry points. |
+| `playbooks/` | Six operational entry points. |
 | `tasks/` | Shared production task sequences. |
 | `filter_plugins/` | Python state classification and node verification. |
 | `library/` | Custom read-only removal inspector. |
@@ -39,7 +39,7 @@ export ANSIBLE_LOCAL_TEMP=/tmp/ansible-semaphore-local
 Run syntax checks without contacting lab nodes:
 
 ```bash
-for playbook in playbooks/*.yml; do
+for playbook in playbooks/*.yml playbooks/*.yaml; do
   ansible-playbook -i inventories/lab/hosts.yml "$playbook" --syntax-check
 done
 ```

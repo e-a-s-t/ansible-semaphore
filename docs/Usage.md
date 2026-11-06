@@ -162,3 +162,20 @@ Never commit either private key, passwords, or other credentials.
 ## Results and next steps
 
 Prerequisites print category reports and an overall readiness result. Preparation prints per-host changes and storage state. Installation reports role, classified state, action, and service status; successful final verification requires all inventory nodes Ready at the configured version. See [public interfaces](Api.md) for failure and check-mode behavior and [Development](Development.md) for offline checks.
+
+## Restart one RKE2 agent
+
+Use the exact inventory alias of an existing worker, with working SSH and become permissions:
+
+```bash
+ansible-playbook -i inventories/lab/hosts.yml playbooks/restart-rke2-agent.yaml \
+  -e target_host=basel-rke2-2
+```
+
+Every normal execution requests a restart, including repeated runs. This temporarily disrupts the worker agent; schedule the operation for an appropriate maintenance window. The playbook does not drain the node or check Kubernetes/workload recovery.
+
+For Semaphore, create a task template using `playbooks/restart-rke2-agent.yaml`, the intended inventory, and its SSH/become credentials. Supply a required string survey variable `target_host` with the exact worker inventory alias (for the lab, `basel-rke2-2`). Do not supply a group name or host pattern. Any Semaphore host limit must include that worker.
+
+Validation runs on the controller without escalation or remote connections. Missing, malformed, unknown, non-worker, control-plane-overlapping, or excluded targets fail before restart. Only the selected worker receives a privileged systemd operation; other selected inventory hosts are not contacted. An entirely empty Ansible host-limit selection can skip all tasks: a no-hosts recap is not a successful restart.
+
+Add `--check` to validate selection and invoke systemd's native check mode without requesting an actual restart. Check mode still contacts the worker and requires target permissions; it is not an offline test. Success in normal mode means systemd completed the restart request, not that Kubernetes or workloads recovered. See [Operations](Operations.md#agent-restart-troubleshooting) for follow-up checks.

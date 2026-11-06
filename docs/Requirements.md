@@ -22,6 +22,7 @@ Stable identifiers are shared with [architecture decisions](Adr.md) and [test ca
 | <a id="req-010"></a>REQ-010 | Preserve Longhorn storage and OS preparation during removal; refuse unsafe ownership, paths, environments, and mounted cleanup state. | Implemented | Removal inspector and guards | [TC-014](Testcases.md#tc-014), [TC-015](Testcases.md#tc-015), [TC-016](Testcases.md#tc-016), [TC-017](Testcases.md#tc-017), [TC-020](Testcases.md#tc-020) |
 | <a id="req-011"></a>REQ-011 | Offer inspection/reporting check mode for RKE2 install/removal without install or cleanup execution. | Implemented | Explicit check-mode guards; still contacts targets | [TC-018](Testcases.md#tc-018) |
 | <a id="req-012"></a>REQ-012 | Validate platform readiness including Cilium/Longhorn dependencies and configured endpoints. | Partially implemented | Local evidence and optional DNS/TCP/TLS probes; runtime/network/application health is incomplete | [TC-021](Testcases.md#tc-021) |
+| <a id="req-013"></a>REQ-013 | Restart rke2-agent only on one explicitly named inventory worker, reject control-plane overlap and excluded targets before restart, and preserve native check-mode/failure behavior. | Implemented | [restart](../playbooks/restart-rke2-agent.yaml) | [TC-023](Testcases.md#tc-023) |
 
 ## Non-functional requirements and technical constraints
 

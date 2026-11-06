@@ -10,6 +10,7 @@ through Ansible Semaphore; this repository does not contain the Semaphore servic
 - OS preparation and safe selection of dedicated worker storage for Longhorn.
 - Explicit RKE2 bootstrap, controlled expansion, and preservation of matching nodes.
 - Protected token backups, Kubernetes node verification, and kubeconfig extraction.
+- Explicit single-worker RKE2 agent restart.
 - Explicitly authorized full-cluster removal with runtime and storage safeguards.
 
 ## Quick start

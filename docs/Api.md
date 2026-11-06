@@ -20,6 +20,7 @@ ansible-playbook -i inventories/lab/hosts.yml playbooks/connectivity.yml
 | `playbooks/prepare-nodes.yml` | proxmox2_targets | OS preparation; worker storage safety rules | Changes and storage readiness report |
 | `playbooks/install-rke2.yml` | selected control_plane/worker | Classify, preserve/bootstrap/join, verify | Sanitized node states; token backup and kubeconfig |
 | `playbooks/remove-rke2.yml` | complete control_plane/worker | Explicit confirmation plus safety preflight | WOULD REMOVE/ABSENT in check mode; REMOVED/ABSENT/INCOMPLETE otherwise |
+| `playbooks/restart-rke2-agent.yaml` | Exactly one worker | Required `target_host` inventory alias; privileged agent restart | Systemd restart result; invalid selections fail before restart |
 
 ### Common CLI options
 

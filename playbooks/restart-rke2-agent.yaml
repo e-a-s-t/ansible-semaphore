@@ -1,0 +1,35 @@
+---
+- name: Restart RKE2 agent on one selected worker
+  hosts: all
+  become: false
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Validate explicit worker selection before contacting targets
+      ansible.builtin.assert:
+        that:
+          - target_host is defined
+          - target_host is string
+          - target_host | length > 0
+          - target_host in groups.get('worker', [])
+          - target_host not in groups.get('control_plane', [])
+          - target_host in ansible_play_hosts_all
+        fail_msg: >-
+          target_host must name exactly one inventory worker, must not be a
+          control-plane host, and must be included in the host limit.
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Freeze validated worker selection for this execution
+      ansible.builtin.set_fact:
+        restart_rke2_selected_host: "{{ target_host }}"
+      run_once: true
+
+    - name: Restart rke2-agent
+      ansible.builtin.systemd_service:
+        name: rke2-agent
+        state: restarted
+      become: true
+      when: inventory_hostname == restart_rke2_selected_host

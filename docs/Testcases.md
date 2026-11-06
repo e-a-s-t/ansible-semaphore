@@ -271,3 +271,13 @@ inactive or disabled units, missing units/properties, inspection errors,
 check-mode observation, and failure blocking subsequent API/kubeconfig work.
 Matching nodes receive only read-only service queries; no start, enable, restart,
 configuration write, or installation operation is added. Fixtures never contact VMs.
+
+### TC-023
+
+Title: Explicit single-worker agent restart
+
+Requirement: [REQ-013](Requirements.md#req-013). Status: Implemented (offline).
+
+Run `python3 -m unittest discover -s tests -p 'test_rke2_restart.py'` in the Ansible environment. [Restart regressions](../tests/test_rke2_restart.py) execute production selection guards with temporary local inventories and replace only the systemd action with an event-recording fixture. Cases cover one privileged agent restart, valid limits, missing/empty/non-string/unknown input, group names and patterns, non-worker and overlapping roles, exclusion by a nonempty limit, systemd failure propagation, and check-mode forwarding. Rejected cases record no restart actions.
+
+Coverage boundary: Fixtures never invoke systemd or SSH. Check-mode coverage verifies forwarding to the module, not systemd's implementation. Live service restart, permissions, Kubernetes recovery, and workload health remain unverified; an entirely empty host-limit selection can skip all Ansible tasks.
